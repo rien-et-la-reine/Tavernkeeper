@@ -1,0 +1,24 @@
+# CMake and Pico SDK build output
+/build/
+/build-*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+*.dis
+
+# Editor and operating-system files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*.log
+
