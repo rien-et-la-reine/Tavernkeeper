@@ -15,6 +15,8 @@ typedef struct {
     uint8_t pin_controller_out;
     uint8_t pin_controller_in;
     uint8_t pin_chip_select;
+
+    uint8_t pin_card_available;
 } sd_spi_config_t;
 
 /* Caller-owned state; no allocation is performed by this backend. */
@@ -23,6 +25,8 @@ typedef struct {
     sd_spi_config_t config;
     bool configured;
     bool initialized;
+    bool card_type_legacy;
+    bool card_type_hcxc;
 } sd_spi_t;
 
 block_device_result_t sd_spi_configure(
