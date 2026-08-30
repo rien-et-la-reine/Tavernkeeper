@@ -243,6 +243,24 @@ static block_device_result_t sd_spi_device_read_blocks(
         return BLOCK_DEVICE_RESULT_NOT_INITIALIZED;
     }
 
+    //requested block count check to determine command
+
+    //check hcxc flag for block address vs. byte address
+
+    //issue command and collect r1
+
+    //validate r1 response
+
+    //for each block:
+    //wait for either data start or data error token (100ms timeout)
+    //read in block and discard 2 byte crc
+
+    //if multiblock:
+    //cmd12 stop transmission
+    //stuff byte
+    //r1 response
+    //wait_ready
+
     /* TODO(owner): Implement bounded-time SD SPI block reads. */
     return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
 }
