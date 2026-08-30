@@ -192,6 +192,7 @@ static block_device_result_t sd_spi_device_init(void *context)
     return BLOCK_DEVICE_RESULT_OK;
 }
 
+// if IO_ERROR is returned, spi resources remain configured and device remains initialized. if a forced shutdown path becomes neccessary that will be handled elsewhere
 static block_device_result_t sd_spi_device_deinit(void *context)
 {
     sd_spi_t *const sd = context;
@@ -199,8 +200,29 @@ static block_device_result_t sd_spi_device_deinit(void *context)
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
 
-    /* TODO(owner): Release the SPI/GPIO resources owned by this backend. */
-    return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
+    if (sd->initialized) {
+        gpio_put(sd->config.pin_chip_select, false);
+        if (!sd_spi_wait_ready(sd)) {
+            sd_spi_release_bus(sd);
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+        sd_spi_release_bus(sd);
+    } else {
+        gpio_put(sd->config.pin_chip_select, true);
+    }
+
+    spi_deinit(sd->config.spi);
+    gpio_deinit(sd->config.pin_clock);
+    gpio_deinit(sd->config.pin_controller_out);
+    gpio_deinit(sd->config.pin_controller_in);
+    gpio_deinit(sd->config.pin_chip_select);
+    gpio_deinit(sd->config.pin_card_available);
+
+    sd->initialized = false;
+    sd->card_type_legacy = false;
+    sd->card_type_hcxc = false;
+
+    return BLOCK_DEVICE_RESULT_OK;
 }
 
 static block_device_result_t sd_spi_device_read_blocks(
