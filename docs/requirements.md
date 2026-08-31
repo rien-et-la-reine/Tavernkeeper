@@ -14,14 +14,6 @@ Tavernkeep is the firmware for Tome, an embedded dual-display ereader and mp3 pl
 <!--
 Record observable behaviors. Prefer "Tavernkeep shall ..." statements with
 explicit inputs, conditions, and outcomes where those details are known.
-
-Suggested entry:
-
-### FR-NNN — Short name
-
-- Requirement:
-- Rationale:
-- Verification approach:
 -->
 
 - **FR-001 — EPUB Reading:** Tavernkeep shall allow the user to discover, open, read, and navigate EPUB files stored on the device.
@@ -53,28 +45,28 @@ Suggested entry:
 Record qualities or performance expectations such as timing, reliability,
 resource use, maintainability, safety, or usability. Include measurable limits
 and operating conditions when they become known.
-
-Suggested entry:
-
-### NFR-NNN — Short name
-
-- Requirement:
-- Rationale:
-- Verification approach:
 -->
+
+- **NFR-001 — Responsiveness:** Tavernkeep shall respond to physical user input promptly enough that interaction feels immediate during normal operation, independent of the slower refresh characteristics of the e-ink displays.
+
+- **NFR-002 — Audio Continuity:** Tavernkeep shall maintain continuous audio playback during normal operation without user-perceptible interruptions caused by routine storage access, user input, or display activity.
+
+- **NFR-003 — Data Integrity:** Tavernkeep shall minimize the risk of corruption to user content and persistent device state during normal operation, recoverable errors, shutdown, and storage access.
+
+- **NFR-004 — Error Isolation:** Errors involving an individual peripheral, file, or unsupported/malformed piece of content shall not unnecessarily prevent continued operation of unrelated device functionality.
+
+- **NFR-005 — Resource Constraints:** Tavernkeep shall operate within the processing, memory, and storage resources available on Tome's embedded hardware without requiring external application memory or network-hosted services.
+
+- **NFR-006 — Power Efficiency:** Tavernkeep shall allow unused hardware and firmware subsystems to enter reduced-power or inactive states where practical, and shall avoid unnecessary activity that materially reduces battery life.
+
+- **NFR-007 — Offline Operation:** Tavernkeep shall provide all required device functionality without reliance on network connectivity, cloud services, or remote computation.
+
+- **NFR-008 — Recoverability:** Tavernkeep shall recover gracefully from expected transient failures where practical, including removable-storage errors and peripheral communication failures, without requiring unnecessary full-device resets.
 
 ## Constraints
 <!--
 Record externally imposed limits that restrict the solution space, such as
 hardware, interfaces, standards, dependencies, power budgets, or toolchains.
-
-Suggested entry:
-
-### CON-NNN — Short name
-
-- Constraint:
-- Source or rationale:
-- Engineering impact:
 -->
 - **CON-001 — Dual Displays:** Tome shall use two e-ink displays. Tavernkeep shall be designed around this dual-display hardware configuration.
 
