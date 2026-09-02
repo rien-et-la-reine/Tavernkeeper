@@ -61,6 +61,12 @@ static uint8_t complete_command(void)
     const uint8_t command = command_bytes[0] & 0x3fU;
     command_byte_count = 0U;
 
+    /* CMD12 aborts any unread data from an active multiple-block stream. */
+    if (command == 12U) {
+        response_head = 0U;
+        response_tail = 0U;
+    }
+
     if (command >= MOCK_COMMAND_COUNT) {
         return 0xffU;
     }
@@ -78,6 +84,10 @@ static uint8_t complete_command(void)
         return 0xffU;
     }
 
+    if (command == 12U) {
+        /* CMD12 has one positional stuff byte before its R1 response. */
+        enqueue_response(0x00U);
+    }
     enqueue_response(behavior->r1);
     for (size_t i = 0U; i < behavior->payload_size; ++i) {
         enqueue_response(behavior->payload[i]);
@@ -90,13 +100,6 @@ static uint8_t transfer_byte(uint8_t tx)
     if (spi_tx_count < MOCK_TX_CAPACITY) {
         spi_tx_log[spi_tx_count++] = tx;
     }
-
-    if (response_head < response_tail) {
-        return response_bytes[response_head++];
-    }
-
-    response_head = 0U;
-    response_tail = 0U;
 
     if (command_byte_count != 0U) {
         command_bytes[command_byte_count++] = tx;
@@ -111,6 +114,13 @@ static uint8_t transfer_byte(uint8_t tx)
         command_byte_count = 1U;
         return 0xffU;
     }
+
+    if (response_head < response_tail) {
+        return response_bytes[response_head++];
+    }
+
+    response_head = 0U;
+    response_tail = 0U;
 
     if (tx == 0xffU && busy_cycles != 0U) {
         busy_cycles--;
@@ -192,6 +202,11 @@ size_t pico_mock_spi_transfer_count(void)
 const uint8_t *pico_mock_spi_tx_log(void)
 {
     return spi_tx_log;
+}
+
+size_t pico_mock_sd_pending_response_count(void)
+{
+    return response_tail - response_head;
 }
 
 void pico_mock_sd_set_busy_cycles(size_t cycles)
@@ -325,4 +340,3 @@ void sleep_ms(uint32_t milliseconds)
 {
     mock_now += milliseconds;
 }
-

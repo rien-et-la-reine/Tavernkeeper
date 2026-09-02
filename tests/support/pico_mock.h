@@ -18,6 +18,7 @@ unsigned int pico_mock_spi_initial_baudrate(void);
 unsigned int pico_mock_spi_baudrate(void);
 size_t pico_mock_spi_transfer_count(void);
 const uint8_t *pico_mock_spi_tx_log(void);
+size_t pico_mock_sd_pending_response_count(void);
 
 void pico_mock_sd_set_busy_cycles(size_t cycles);
 void pico_mock_sd_set_command(
@@ -29,4 +30,3 @@ size_t pico_mock_sd_command_count(uint8_t command);
 uint32_t pico_mock_sd_last_argument(uint8_t command);
 
 #endif
-

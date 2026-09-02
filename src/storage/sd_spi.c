@@ -7,7 +7,21 @@
 
 static bool sd_spi_wait_ready(const sd_spi_t *sd);
 static uint8_t sd_spi_transfer(const sd_spi_t *sd, uint8_t tx);
-static uint8_t sd_spi_command(const sd_spi_t *sd, uint8_t cmd, uint32_t arg);
+static block_device_result_t sd_spi_command(
+    const sd_spi_t *sd,
+    uint8_t cmd,
+    uint32_t arg,
+    uint8_t *r1);
+static block_device_result_t sd_spi_stop_transmission(const sd_spi_t *sd);
+static block_device_result_t sd_spi_read_csd(
+    const sd_spi_t *sd,
+    uint64_t *block_count);
+static block_device_result_t sd_spi_init_rollback(
+    sd_spi_t *sd,
+    block_device_result_t result);
+static void sd_spi_capture_bus(const sd_spi_t *sd) {
+    gpio_put(sd->config.pin_chip_select, false);
+}
 static void sd_spi_release_bus(const sd_spi_t *sd) {
     gpio_put(sd->config.pin_chip_select, true);
     sd_spi_transfer(sd, 0xFF);
@@ -40,7 +54,7 @@ block_device_result_t sd_spi_configure(
     sd_spi_t *sd,
     const sd_spi_config_t *config)
 {
-    if (sd == NULL || config == NULL || config->spi == NULL
+    if (sd == NULL || sd->initialized == true || config == NULL || config->spi == NULL
             || config->baud_rate_hz == 0U || config->baud_rate_hz > 25000000U) {
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
@@ -48,6 +62,7 @@ block_device_result_t sd_spi_configure(
     sd->config = *config;
     sd->configured = true;
     sd->initialized = false;
+    sd->block_count = 0U;
     sd->block_device.context = sd;
     sd->block_device.operations = &sd_spi_operations;
 
@@ -65,28 +80,31 @@ block_device_t *sd_spi_as_block_device(sd_spi_t *sd)
 static block_device_result_t sd_spi_device_init(void *context)
 {
     sd_spi_t *const sd = context;
-    if (sd == NULL || !sd->configured) {
+    if (sd == NULL || !sd->configured || sd->initialized) {
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
 
     sd->initialized = false;
     sd->card_type_legacy = false;
     sd->card_type_hcxc = false;
+    sd->block_count = 0U;
 
+    //check for card present and writeable
+    gpio_init(sd->config.pin_card_available); // external hardware pullup required
+    if (gpio_get(sd->config.pin_card_available) != 0) {
+        gpio_deinit(sd->config.pin_card_available);
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
+
+    //configure remaining gpio and spi
     spi_init(sd->config.spi, 400000); //init using slower baud rate, will switch to higher one later
     gpio_init(sd->config.pin_chip_select);
     gpio_put(sd->config.pin_chip_select, true); //for safety to avoid accidentally asserting cs
     gpio_set_dir(sd->config.pin_chip_select, GPIO_OUT);
-    gpio_init(sd->config.pin_card_available); // external hardware pullup required
     gpio_set_dir(sd->config.pin_card_available, GPIO_IN);
     gpio_set_function(sd->config.pin_clock, GPIO_FUNC_SPI);
     gpio_set_function(sd->config.pin_controller_in, GPIO_FUNC_SPI);
     gpio_set_function(sd->config.pin_controller_out, GPIO_FUNC_SPI);
-
-    //check if card present and not write protected
-    if (gpio_get(sd->config.pin_card_available) != 0) {
-        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
-    }
 
     //cs high
     gpio_put(sd->config.pin_chip_select, true);
@@ -97,66 +115,74 @@ static block_device_result_t sd_spi_device_init(void *context)
         sd_spi_transfer(sd, 0xFF);
     }
     //cs low
-    gpio_put(sd->config.pin_chip_select, false);
+    sd_spi_capture_bus(sd);
 
     uint8_t r1 = 0xFF;
+    block_device_result_t result;
     //cmd0
-    r1 = sd_spi_command(sd, 0, 0);
+    result = sd_spi_command(sd, 0, 0, &r1);
+    if (result != BLOCK_DEVICE_RESULT_OK) {
+        return sd_spi_init_rollback(sd, result);
+    }
     //check R1 = 0x01 (in idle state)
     if (r1 != 0x01) {
-        sd_spi_release_bus(sd);
-        return BLOCK_DEVICE_RESULT_IO_ERROR;
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
     }
     //cmd8 with arg 0x1AA
-    r1 = sd_spi_command(sd, 8, 0x1AA);
+    result = sd_spi_command(sd, 8, 0x1AA, &r1);
+    if (result != BLOCK_DEVICE_RESULT_OK) {
+        return sd_spi_init_rollback(sd, result);
+    }
     if (r1 == 0x01) {
         //read R7, card type is v2+
         sd_spi_transfer(sd, 0xFF);
         sd_spi_transfer(sd, 0xFF);
         if ((sd_spi_transfer(sd, 0xFF) & 0x0F) != 0x01) {
-            sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_IO_ERROR; 
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
         }
         if (sd_spi_transfer(sd, 0xFF) != 0xAA) { 
-            sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_IO_ERROR; 
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
         }
     } else if (r1 == 0x05) {
         //card type is v1
         sd->card_type_legacy = true;
     } else {
-        sd_spi_release_bus(sd);
-        return BLOCK_DEVICE_RESULT_IO_ERROR;
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
     }
     //omitting ocr check since we're operating at 3v3 anyway and supporting that's basically mandated by the spec for all cards
     //repeat ACMD41 until card not idle, make sure to set the HCS bit if card is v2
     absolute_time_t timeout = make_timeout_time_ms(1200); //slightly higher to account for starting timer before first attempt
     do {
-        r1 = sd_spi_command(sd, 55, 0);
+        result = sd_spi_command(sd, 55, 0, &r1);
+        if (result != BLOCK_DEVICE_RESULT_OK) {
+            return sd_spi_init_rollback(sd, result);
+        }
         if (r1 > 0x01) { 
-            sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_IO_ERROR; 
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
         }
         if (sd->card_type_legacy) {
-            r1 = sd_spi_command(sd, 41, 0);
+            result = sd_spi_command(sd, 41, 0, &r1);
         } else {
-            r1 = sd_spi_command(sd, 41, 0x40000000);
+            result = sd_spi_command(sd, 41, 0x40000000, &r1);
+        }
+        if (result != BLOCK_DEVICE_RESULT_OK) {
+            return sd_spi_init_rollback(sd, result);
         }
         if (r1 > 0x01) { 
-            sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_IO_ERROR; 
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
         }
         //repeat ACMD41 until R1 response no longer reads IDLE_STATE
     } while (!time_reached(timeout) && (r1 == 0x01));
     if (r1 != 0x00) { 
-        sd_spi_release_bus(sd);
-        return BLOCK_DEVICE_RESULT_IO_ERROR; 
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
     }
     //cmd58 to get ocr, check ccs to verify SDSC or SDHC card (byte addressing vs block addressing)
-    r1 = sd_spi_command(sd, 58, 0);
+    result = sd_spi_command(sd, 58, 0, &r1);
+    if (result != BLOCK_DEVICE_RESULT_OK) {
+        return sd_spi_init_rollback(sd, result);
+    }
     if (r1 != 0x00) { 
-        sd_spi_release_bus(sd);
-        return BLOCK_DEVICE_RESULT_IO_ERROR; 
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
     }
     uint8_t ocr_msb = sd_spi_transfer(sd, 0xFF); //not R1 format, first byte of OCR
     sd_spi_transfer(sd, 0xFF);
@@ -164,19 +190,25 @@ static block_device_result_t sd_spi_device_init(void *context)
     sd_spi_transfer(sd, 0xFF);
     if ((ocr_msb & 0x80) != 0x80) {
         //not powered up for some reason
-        sd_spi_release_bus(sd);
-        return BLOCK_DEVICE_RESULT_IO_ERROR;
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
     }
     if (((ocr_msb & 0x40) == 0x40) && (!sd->card_type_legacy)) {
         sd->card_type_hcxc = true;
     }
 
+    result = sd_spi_read_csd(sd, &sd->block_count);
+    if (result != BLOCK_DEVICE_RESULT_OK) {
+        return sd_spi_init_rollback(sd, result);
+    }
+
     if (!sd->card_type_hcxc) {
         //for sdsc card need to set block length to 512 with cmd16
-        r1 = sd_spi_command(sd, 16, 512);
+        result = sd_spi_command(sd, 16, 512, &r1);
+        if (result != BLOCK_DEVICE_RESULT_OK) {
+            return sd_spi_init_rollback(sd, result);
+        }
         if (r1 != 0x00) { 
-            sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_IO_ERROR; 
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
         }
     }
 
@@ -192,7 +224,7 @@ static block_device_result_t sd_spi_device_init(void *context)
     return BLOCK_DEVICE_RESULT_OK;
 }
 
-// if IO_ERROR is returned, spi resources remain configured and device remains initialized. if a forced shutdown path becomes neccessary that will be handled elsewhere
+// On a busy timeout, SPI resources remain configured and the device remains initialized.
 static block_device_result_t sd_spi_device_deinit(void *context)
 {
     sd_spi_t *const sd = context;
@@ -201,10 +233,10 @@ static block_device_result_t sd_spi_device_deinit(void *context)
     }
 
     if (sd->initialized) {
-        gpio_put(sd->config.pin_chip_select, false);
+        sd_spi_capture_bus(sd);
         if (!sd_spi_wait_ready(sd)) {
             sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_IO_ERROR;
+            return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
         }
         sd_spi_release_bus(sd);
     } else {
@@ -221,6 +253,7 @@ static block_device_result_t sd_spi_device_deinit(void *context)
     sd->initialized = false;
     sd->card_type_legacy = false;
     sd->card_type_hcxc = false;
+    sd->block_count = 0U;
 
     return BLOCK_DEVICE_RESULT_OK;
 }
@@ -232,37 +265,127 @@ static block_device_result_t sd_spi_device_read_blocks(
     size_t block_count)
 {
     sd_spi_t *const sd = context;
-    (void)first_lba;
-    (void)buffer;
-    (void)block_count;
 
-    if (sd == NULL || !sd->configured) {
+    if (sd == NULL || !sd->configured || buffer == NULL || block_count == 0U) {
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
     if (!sd->initialized) {
         return BLOCK_DEVICE_RESULT_NOT_INITIALIZED;
     }
+    if (first_lba >= sd->block_count
+            || (uint64_t)block_count > sd->block_count - first_lba) {
+        return BLOCK_DEVICE_RESULT_OUT_OF_RANGE;
+    }
+
+    uint8_t r1, token;
+    uint8_t *buf = buffer;
+    block_device_result_t result;
+
+    //adjust block address to byte address for sdsc cards
+    if (!sd->card_type_hcxc) {
+        first_lba *= 512U;
+    }
+
+
+    //assert chip select
+    sd_spi_capture_bus(sd);
 
     //requested block count check to determine command
+    if (block_count != 1) {
+        //multiblock read
+        //issue command and collect r1
+        result = sd_spi_command(sd, 18, (uint32_t)first_lba, &r1);
+        if (result != BLOCK_DEVICE_RESULT_OK) {
+            sd_spi_release_bus(sd);
+            return result;
+        }
+        //validate r1 response
+        if (r1 == 0x00) {
+            do {
+                absolute_time_t timeout = make_timeout_time_ms(100);
+                do {
+                    token = sd_spi_transfer(sd, 0xFF);
+                    if (token == 0xFE) {
+                        //data response token, read in block to buffer and discard 2 byte crc
+                        for (uint16_t i = 0; i < 512; i++) {
+                            *buf++ = sd_spi_transfer(sd, 0xFF);
+                        }
+                        //discard CRC
+                        sd_spi_transfer(sd, 0xFF);
+                        sd_spi_transfer(sd, 0xFF);
+                        break;
+                    } else if (((token & 0xF0) == 0x00) && (token & 0x01)) {
+                        //data error token, issue command 12 and release bus
+                        result = sd_spi_stop_transmission(sd);
+                        sd_spi_release_bus(sd);
+                        if (result == BLOCK_DEVICE_RESULT_BUSY_TIMEOUT) {
+                            return result;
+                        }
+                        return BLOCK_DEVICE_RESULT_IO_ERROR;
+                    }
+                } while (!time_reached(timeout));
+                if (token != 0xFE) {
+                    break;
+                }
+            } while (--block_count);
 
-    //check hcxc flag for block address vs. byte address
+            result = sd_spi_stop_transmission(sd);
+            sd_spi_release_bus(sd);
+            if (result != BLOCK_DEVICE_RESULT_OK) {
+                return result;
+            }
+            return token == 0xFE
+                ? BLOCK_DEVICE_RESULT_OK
+                : BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+        //an error occurred before CMD18 entered the data-transfer state
+        if (!sd_spi_wait_ready(sd)) {
+            sd_spi_release_bus(sd);
+            return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
+        }
+        sd_spi_release_bus(sd);
+        return BLOCK_DEVICE_RESULT_IO_ERROR;
 
-    //issue command and collect r1
+    } else {
+        //single block read command 17
+        result = sd_spi_command(sd, 17, (uint32_t)first_lba, &r1);
+        if (result != BLOCK_DEVICE_RESULT_OK) {
+            sd_spi_release_bus(sd);
+            return result;
+        }
+        if (r1 == 0x00) {
+            //no errors, wait for data start token, timeout 100ms
+            absolute_time_t timeout = make_timeout_time_ms(100);
+            do {
+                token = sd_spi_transfer(sd, 0xFF);
+                if (token == 0xFE) {
+                    //data response token, read in block to buffer and discard 2 byte crc
+                    for (uint16_t i = 0; i < 512; i++) {
+                        *buf++ = sd_spi_transfer(sd, 0xFF);
+                    }
+                    //discard CRC
+                    sd_spi_transfer(sd, 0xFF);
+                    sd_spi_transfer(sd, 0xFF);
+                    break;
+                }
+                if (((token & 0xF0) == 0x00) && (token & 0x01)) {
+                    //data error token
+                    sd_spi_release_bus(sd);
+                    return BLOCK_DEVICE_RESULT_IO_ERROR;
+                }
+            } while (!time_reached(timeout));
 
-    //validate r1 response
+            if (token == 0xFE) {
+                //did not time out
+                sd_spi_release_bus(sd);
+                return BLOCK_DEVICE_RESULT_OK;
+            }
+        }
+    }
 
-    //for each block:
-    //wait for either data start or data error token (100ms timeout)
-    //read in block and discard 2 byte crc
-
-    //if multiblock:
-    //cmd12 stop transmission
-    //stuff byte
-    //r1 response
-    //wait_ready
-
-    /* TODO(owner): Implement bounded-time SD SPI block reads. */
-    return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
+    //timed out or r1 error
+    sd_spi_release_bus(sd);
+    return BLOCK_DEVICE_RESULT_IO_ERROR;
 }
 
 static block_device_result_t sd_spi_device_write_blocks(
@@ -305,6 +428,144 @@ static block_device_result_t sd_spi_device_get_info(
     return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
 }
 
+// The caller owns the captured bus and remains responsible for releasing it.
+static block_device_result_t sd_spi_stop_transmission(const sd_spi_t *sd)
+{
+    // CMD12 must be sent while the card is still in the active CMD18 state.
+    sd_spi_transfer(sd, 12U | 0x40U);
+    sd_spi_transfer(sd, 0x00U);
+    sd_spi_transfer(sd, 0x00U);
+    sd_spi_transfer(sd, 0x00U);
+    sd_spi_transfer(sd, 0x00U);
+    sd_spi_transfer(sd, 0x01U);
+
+    // CMD12 has one positional stuff byte before its R1 response in SPI mode.
+    sd_spi_transfer(sd, 0xFFU);
+
+    uint8_t r1 = 0xFFU;
+    for (uint8_t i = 0U; i < 8U; ++i) {
+        r1 = sd_spi_transfer(sd, 0xFFU);
+        if ((r1 & 0x80U) == 0U) {
+            break;
+        }
+    }
+    if (!sd_spi_wait_ready(sd)) {
+        return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
+    }
+    return r1 == 0x00U
+        ? BLOCK_DEVICE_RESULT_OK
+        : BLOCK_DEVICE_RESULT_IO_ERROR;
+}
+
+static block_device_result_t sd_spi_read_csd(
+    const sd_spi_t *sd,
+    uint64_t *block_count)
+{
+    //issue command 9 and check result and r1
+    uint8_t r1;
+    block_device_result_t result = sd_spi_command(sd, 9, 0, &r1);
+    if (result != BLOCK_DEVICE_RESULT_OK) {
+        return result;
+    }
+    if (r1 != 0x00) {
+        return BLOCK_DEVICE_RESULT_IO_ERROR;
+    }
+
+    //wait for data token
+    uint8_t token;
+    absolute_time_t timeout = make_timeout_time_ms(100);
+    do {
+        token = sd_spi_transfer(sd, 0xFF);
+        if (token == 0xFE) {
+            //data start token
+            break;
+        }
+        if (((token & 0xF0) == 0x00) && (token & 0x01)) {
+            //data error token
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+    } while (!time_reached(timeout));
+    if (token != 0xFE) {
+        //timeout
+        return BLOCK_DEVICE_RESULT_IO_ERROR;
+    }
+
+    //data start token recieved, read in 16 byte CSD register
+    uint8_t csd[16];
+    for (size_t i = 0U; i < sizeof(csd); ++i) {
+        csd[i] = sd_spi_transfer(sd, 0xFF);
+    }
+    //discard crc
+    sd_spi_transfer(sd, 0xFF);
+    sd_spi_transfer(sd, 0xFF);
+
+    //check csd structure to determine version (version 1.0 for sdsc and 2.0 for sdhc/sdxc. sduc not supported)
+    const uint8_t csd_structure = (uint8_t)(csd[0] >> 6U);
+    if (csd_structure == 0U) {
+        //version 1.0, only for sdsc cards, doing a sanity check
+        if (sd->card_type_hcxc) {
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+
+        //check maximum read data block length
+        const uint8_t read_bl_len = csd[5] & 0x0FU;
+        if (read_bl_len < 9U || read_bl_len > 11U) {
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+        //check device size and corresponding multiplier field
+        const uint32_t c_size = ((uint32_t)(csd[6] & 0x03U) << 10U)
+            | ((uint32_t)csd[7] << 2U)
+            | ((uint32_t)(csd[8] & 0xC0U) >> 6U);
+        const uint8_t c_size_mult = (uint8_t)(((csd[9] & 0x03U) << 1U)
+            | ((csd[10] & 0x80U) >> 7U));
+        //calculate capacity in bytes based on size and multiplier
+        const uint64_t capacity_bytes = ((uint64_t)c_size + 1U)
+            * (1ULL << (c_size_mult + 2U)) * (1ULL << read_bl_len);
+        //double check that byte capacity is a valid value (non-zero and divisible into 512 byte blocks)
+        if (capacity_bytes == 0U || (capacity_bytes % 512U) != 0U) {
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+        //calculate block capacity from byte capacity and store it
+        *block_count = capacity_bytes / 512U;
+        return BLOCK_DEVICE_RESULT_OK;
+    }
+
+    if (csd_structure == 1U) {
+        //version 2.0, for sdhc and sdxc cards, double check that the card is of the correct type
+        if (!sd->card_type_hcxc) {
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
+        //check device size (longer field in the register than version 1.0)
+        const uint32_t c_size = ((uint32_t)(csd[7] & 0x3FU) << 16U)
+            | ((uint32_t)csd[8] << 8U)
+            | (uint32_t)csd[9];
+        //the spec's 512 KByte capacity unit equals 1024 logical 512-byte blocks
+        *block_count = ((uint64_t)c_size + 1U) * 1024U;
+        return BLOCK_DEVICE_RESULT_OK;
+    }
+
+    //version 3.0 for sduc not implemented
+    return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
+}
+
+static block_device_result_t sd_spi_init_rollback(
+    sd_spi_t *sd,
+    block_device_result_t result)
+{
+    sd_spi_release_bus(sd);
+    spi_deinit(sd->config.spi);
+    gpio_deinit(sd->config.pin_clock);
+    gpio_deinit(sd->config.pin_controller_out);
+    gpio_deinit(sd->config.pin_controller_in);
+    gpio_deinit(sd->config.pin_chip_select);
+    gpio_deinit(sd->config.pin_card_available);
+    sd->initialized = false;
+    sd->card_type_legacy = false;
+    sd->card_type_hcxc = false;
+    sd->block_count = 0U;
+    return result;
+}
+
 static bool sd_spi_wait_ready(const sd_spi_t *sd) {
     absolute_time_t timeout = make_timeout_time_ms(1000);
     while (!time_reached(timeout)) {
@@ -322,12 +583,19 @@ static uint8_t sd_spi_transfer(const sd_spi_t *sd, uint8_t tx) {
     return rx;
 }
 
-static uint8_t sd_spi_command(const sd_spi_t *sd, uint8_t cmd, uint32_t arg) {
+static block_device_result_t sd_spi_command(
+    const sd_spi_t *sd,
+    uint8_t cmd,
+    uint32_t arg,
+    uint8_t *r1)
+{
     uint8_t i = 0;
-    uint8_t r1; // R1 response byte
+    uint8_t response;
 
-    //ensure card is ready, if timed out pass that on
-    if (!sd_spi_wait_ready(sd)) { return 0xFF; }
+    //ensure card is ready and preserve a distinct busy-timeout result
+    if (!sd_spi_wait_ready(sd)) {
+        return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
+    }
     //send command index cmd
     sd_spi_transfer(sd, cmd | 0x40);
     //send argument arg, big endian
@@ -344,10 +612,12 @@ static uint8_t sd_spi_command(const sd_spi_t *sd, uint8_t cmd, uint32_t arg) {
         sd_spi_transfer(sd, 0x00|0x01);
     }
     //wait for R1 response
-    while (((r1 = sd_spi_transfer(sd, 0xFF)) & 0x80) == 0x80) {
+    while (((response = sd_spi_transfer(sd, 0xFF)) & 0x80) == 0x80) {
         i++;
-        if (i > 7) { return 0xFF; }
+        if (i > 7) {
+            return BLOCK_DEVICE_RESULT_IO_ERROR;
+        }
     }
-    //returns R1 when recieved or 0xFF if timeout occured
-    return r1;
+    *r1 = response;
+    return BLOCK_DEVICE_RESULT_OK;
 }

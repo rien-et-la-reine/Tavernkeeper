@@ -11,6 +11,7 @@ typedef enum {
     BLOCK_DEVICE_RESULT_NOT_INITIALIZED,
     BLOCK_DEVICE_RESULT_OUT_OF_RANGE,
     BLOCK_DEVICE_RESULT_IO_ERROR,
+    BLOCK_DEVICE_RESULT_BUSY_TIMEOUT,
     BLOCK_DEVICE_RESULT_INVALID_DEVICE, //either write protected or no card detected
     BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED,
 } block_device_result_t;
@@ -110,4 +111,3 @@ static inline block_device_result_t block_device_get_info(
 }
 
 #endif
-
