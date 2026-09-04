@@ -9,15 +9,14 @@
 enum {
     MOCK_PIN_COUNT = 64,
     MOCK_COMMAND_COUNT = 64,
-    MOCK_MAX_COMMAND_PAYLOAD = 2048,
-    MOCK_RESPONSE_CAPACITY = 4096,
+    MOCK_RESPONSE_CAPACITY = 8192,
     MOCK_TX_CAPACITY = 16384,
 };
 
 typedef struct {
     bool configured;
     uint8_t r1;
-    uint8_t payload[MOCK_MAX_COMMAND_PAYLOAD];
+    uint8_t payload[PICO_MOCK_MAX_COMMAND_PAYLOAD];
     size_t payload_size;
     size_t count;
     uint32_t last_argument;
@@ -214,16 +213,16 @@ void pico_mock_sd_set_busy_cycles(size_t cycles)
     busy_cycles = cycles;
 }
 
-void pico_mock_sd_set_command(
+bool pico_mock_sd_set_command(
     uint8_t command,
     uint8_t r1,
     const uint8_t *payload,
     size_t payload_size)
 {
     if (command >= MOCK_COMMAND_COUNT
-            || payload_size > MOCK_MAX_COMMAND_PAYLOAD
+            || payload_size > PICO_MOCK_MAX_COMMAND_PAYLOAD
             || (payload_size != 0U && payload == NULL)) {
-        return;
+        return false;
     }
 
     mock_command_t *const behavior = &commands[command];
@@ -233,6 +232,7 @@ void pico_mock_sd_set_command(
     if (payload_size != 0U) {
         memcpy(behavior->payload, payload, payload_size);
     }
+    return true;
 }
 
 size_t pico_mock_sd_command_count(uint8_t command)

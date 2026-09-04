@@ -69,6 +69,8 @@ static inline block_device_result_t block_device_deinit(
     return device->operations->deinit(device->context);
 }
 
+/* If a read returns anything other than BLOCK_DEVICE_RESULT_OK, the contents
+ * of the entire requested destination are unspecified and must be discarded. */
 static inline block_device_result_t block_device_read_blocks(
     const block_device_t *device,
     uint64_t first_lba,

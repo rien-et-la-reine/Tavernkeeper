@@ -18,6 +18,18 @@
             ],
             "svdFile": "${userHome}/.pico-sdk/sdk/2.3.0/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
             "runToEntryPoint": "main",
+            "rttConfig": {
+                "enabled": true,
+                "address": "auto",
+                "rtt_start_retry": 1000,
+                "decoders": [
+                    {
+                        "label": "Tavernkeep RTT",
+                        "port": 0,
+                        "type": "console"
+                    }
+                ]
+            },
             // Fix for no_flash binaries, where monitor reset halt doesn't do what is expected
             // Also works fine for flash binaries
             "overrideLaunchCommands": [

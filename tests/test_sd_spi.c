@@ -198,6 +198,212 @@ static bool buffer_matches(
     return true;
 }
 
+typedef struct {
+    block_device_result_t result;
+    size_t transfer_count;
+    size_t cmd9_count;
+    size_t cmd12_count;
+    size_t cmd17_count;
+    size_t cmd18_count;
+    bool chip_select_released;
+    bool initialized;
+    bool card_type_legacy;
+    bool card_type_hcxc;
+    uint64_t block_count;
+    bool spi_initialized;
+    bool all_gpio_deinitialized;
+} error_token_observation_t;
+
+static error_token_observation_t observe_cmd17_error_token(uint8_t token)
+{
+    uint8_t block[SD_BLOCK_SIZE];
+    error_token_observation_t observation = { 0 };
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    if (device == NULL
+            || !pico_mock_sd_set_command(17U, 0x00U, &token, 1U)) {
+        failures++;
+        observation.result = BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
+        return observation;
+    }
+
+    const size_t transfers_before = pico_mock_spi_transfer_count();
+    observation.result = block_device_read_blocks(device, 0U, block, 1U);
+    observation.transfer_count =
+        pico_mock_spi_transfer_count() - transfers_before;
+    observation.cmd17_count = pico_mock_sd_command_count(17U);
+    observation.chip_select_released =
+        pico_mock_gpio_level(PIN_CHIP_SELECT);
+    return observation;
+}
+
+static error_token_observation_t observe_cmd18_error_token(uint8_t token)
+{
+    uint8_t blocks[2U * SD_BLOCK_SIZE];
+    error_token_observation_t observation = { 0 };
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    if (device == NULL
+            || !pico_mock_sd_set_command(18U, 0x00U, &token, 1U)
+            || !pico_mock_sd_set_command(12U, 0x00U, NULL, 0U)) {
+        failures++;
+        observation.result = BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
+        return observation;
+    }
+
+    const size_t transfers_before = pico_mock_spi_transfer_count();
+    observation.result = block_device_read_blocks(device, 0U, blocks, 2U);
+    observation.transfer_count =
+        pico_mock_spi_transfer_count() - transfers_before;
+    observation.cmd12_count = pico_mock_sd_command_count(12U);
+    observation.cmd18_count = pico_mock_sd_command_count(18U);
+    observation.chip_select_released =
+        pico_mock_gpio_level(PIN_CHIP_SELECT);
+    return observation;
+}
+
+static error_token_observation_t observe_cmd9_error_token(uint8_t token)
+{
+    error_token_observation_t observation = { 0 };
+    const sd_spi_config_t config = valid_config();
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    if (sd_spi_configure(&sd, &config) != BLOCK_DEVICE_RESULT_OK) {
+        failures++;
+        observation.result = BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
+        return observation;
+    }
+    configure_successful_sdhc_card();
+    if (!pico_mock_sd_set_command(9U, 0x00U, &token, 1U)) {
+        failures++;
+        observation.result = BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
+        return observation;
+    }
+
+    observation.result = block_device_init(sd_spi_as_block_device(&sd));
+    observation.transfer_count = pico_mock_spi_transfer_count();
+    observation.cmd9_count = pico_mock_sd_command_count(9U);
+    observation.chip_select_released =
+        pico_mock_gpio_level(PIN_CHIP_SELECT);
+    observation.initialized = sd.initialized;
+    observation.card_type_legacy = sd.card_type_legacy;
+    observation.card_type_hcxc = sd.card_type_hcxc;
+    observation.block_count = sd.block_count;
+    observation.spi_initialized = pico_mock_spi_is_initialized();
+    observation.all_gpio_deinitialized =
+        pico_mock_gpio_was_deinitialized(PIN_CLOCK)
+        && pico_mock_gpio_was_deinitialized(PIN_CONTROLLER_OUT)
+        && pico_mock_gpio_was_deinitialized(PIN_CONTROLLER_IN)
+        && pico_mock_gpio_was_deinitialized(PIN_CHIP_SELECT)
+        && pico_mock_gpio_was_deinitialized(PIN_CARD_AVAILABLE);
+    return observation;
+}
+
+static void verify_data_error_token(uint8_t token)
+{
+    const error_token_observation_t cmd17_baseline =
+        observe_cmd17_error_token(0x01U);
+    const error_token_observation_t cmd17 = token == 0x01U
+        ? cmd17_baseline : observe_cmd17_error_token(token);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, cmd17.result);
+    CHECK_EQ(cmd17_baseline.transfer_count, cmd17.transfer_count);
+    CHECK_EQ(1U, cmd17.cmd17_count);
+    CHECK(cmd17.chip_select_released);
+
+    const error_token_observation_t cmd18_baseline =
+        observe_cmd18_error_token(0x01U);
+    const error_token_observation_t cmd18 = token == 0x01U
+        ? cmd18_baseline : observe_cmd18_error_token(token);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, cmd18.result);
+    CHECK_EQ(cmd18_baseline.transfer_count, cmd18.transfer_count);
+    CHECK_EQ(1U, cmd18.cmd18_count);
+    CHECK_EQ(1U, cmd18.cmd12_count);
+    CHECK(cmd18.chip_select_released);
+
+    const error_token_observation_t cmd9_baseline =
+        observe_cmd9_error_token(0x01U);
+    const error_token_observation_t cmd9 = token == 0x01U
+        ? cmd9_baseline : observe_cmd9_error_token(token);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, cmd9.result);
+    CHECK_EQ(cmd9_baseline.transfer_count, cmd9.transfer_count);
+    CHECK_EQ(1U, cmd9.cmd9_count);
+    CHECK(cmd9.chip_select_released);
+    CHECK(!cmd9.initialized);
+    CHECK(!cmd9.card_type_legacy);
+    CHECK(!cmd9.card_type_hcxc);
+    CHECK_EQ(0U, cmd9.block_count);
+    CHECK(!cmd9.spi_initialized);
+    CHECK(cmd9.all_gpio_deinitialized);
+}
+
+static void test_data_error_token_01_is_immediate(void)
+{
+    verify_data_error_token(0x01U);
+}
+
+static void test_data_error_token_02_is_immediate(void)
+{
+    verify_data_error_token(0x02U);
+}
+
+static void test_data_error_token_04_is_immediate(void)
+{
+    verify_data_error_token(0x04U);
+}
+
+static void test_data_error_token_08_is_immediate(void)
+{
+    verify_data_error_token(0x08U);
+}
+
+static void test_zero_is_not_a_data_error_token(void)
+{
+    const error_token_observation_t cmd17_error =
+        observe_cmd17_error_token(0x01U);
+    const error_token_observation_t cmd17_zero =
+        observe_cmd17_error_token(0x00U);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, cmd17_zero.result);
+    CHECK(cmd17_zero.transfer_count > cmd17_error.transfer_count);
+    CHECK(cmd17_zero.chip_select_released);
+
+    const error_token_observation_t cmd18_error =
+        observe_cmd18_error_token(0x01U);
+    const error_token_observation_t cmd18_zero =
+        observe_cmd18_error_token(0x00U);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, cmd18_zero.result);
+    CHECK(cmd18_zero.transfer_count > cmd18_error.transfer_count);
+    CHECK_EQ(1U, cmd18_zero.cmd12_count);
+    CHECK(cmd18_zero.chip_select_released);
+
+    const error_token_observation_t cmd9_error =
+        observe_cmd9_error_token(0x01U);
+    const error_token_observation_t cmd9_zero =
+        observe_cmd9_error_token(0x00U);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, cmd9_zero.result);
+    CHECK(cmd9_zero.transfer_count > cmd9_error.transfer_count);
+    CHECK(!cmd9_zero.initialized);
+    CHECK(!cmd9_zero.spi_initialized);
+    CHECK(cmd9_zero.all_gpio_deinitialized);
+}
+
+static void test_mock_command_configuration_validation(void)
+{
+    static uint8_t oversized_payload[PICO_MOCK_MAX_COMMAND_PAYLOAD + 1U];
+
+    pico_mock_reset();
+    CHECK(!pico_mock_sd_set_command(UINT8_MAX, 0x00U, NULL, 0U));
+    CHECK(!pico_mock_sd_set_command(17U, 0x00U, NULL, 1U));
+    CHECK(!pico_mock_sd_set_command(18U, 0x00U, oversized_payload,
+        sizeof(oversized_payload)));
+    CHECK(pico_mock_sd_set_command(18U, 0x00U, oversized_payload,
+        PICO_MOCK_MAX_COMMAND_PAYLOAD));
+}
+
 static void test_configure_validation(void)
 {
     pico_mock_reset();
@@ -716,7 +922,7 @@ static void test_single_block_read_failures(void)
 static void test_multiple_block_read(void)
 {
     enum {
-        BLOCK_COUNT = 2,
+        BLOCK_COUNT = 4,
         PAYLOAD_SIZE = BLOCK_COUNT * (SD_BLOCK_SIZE + 3),
     };
     uint8_t payload[PAYLOAD_SIZE];
@@ -729,8 +935,9 @@ static void test_multiple_block_read(void)
     CHECK(device != NULL);
     CHECK_EQ(PAYLOAD_SIZE,
         make_read_payload(payload, BLOCK_COUNT, seed));
-    pico_mock_sd_set_command(18U, 0x00U, payload, sizeof(payload));
-    pico_mock_sd_set_command(12U, 0x00U, NULL, 0U);
+    CHECK(pico_mock_sd_set_command(
+        18U, 0x00U, payload, sizeof(payload)));
+    CHECK(pico_mock_sd_set_command(12U, 0x00U, NULL, 0U));
     memset(storage, 0x5a, sizeof(storage));
     const size_t transfers_before = pico_mock_spi_transfer_count();
 
@@ -744,6 +951,7 @@ static void test_multiple_block_read(void)
     CHECK_EQ(1U, pico_mock_sd_command_count(12U));
     CHECK_EQ(0U, pico_mock_sd_last_argument(12U));
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+    CHECK_EQ(0U, pico_mock_sd_pending_response_count());
 
     const size_t stop_offset = transfers_before + 8U
         + (BLOCK_COUNT * (SD_BLOCK_SIZE + 3U));
@@ -754,7 +962,7 @@ static void test_multiple_block_read(void)
     CHECK_EQ(0U, tx_log[stop_offset + 3U]);
     CHECK_EQ(0U, tx_log[stop_offset + 4U]);
     CHECK_EQ(1U, tx_log[stop_offset + 5U]);
-    CHECK_EQ(1048U,
+    CHECK_EQ(2078U,
         pico_mock_spi_transfer_count() - transfers_before);
 }
 
@@ -822,6 +1030,42 @@ static void test_multiple_block_error_cleanup(void)
         block_device_read_blocks(device, 0U, blocks, 2U));
     CHECK_EQ(0U, pico_mock_sd_command_count(12U));
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+}
+
+static void test_multiple_block_error_recovery(void)
+{
+    enum { PAYLOAD_SIZE = SD_BLOCK_SIZE + 3 };
+    uint8_t payload[PAYLOAD_SIZE];
+    uint8_t failed_blocks[2U * SD_BLOCK_SIZE];
+    uint8_t recovered_block[SD_BLOCK_SIZE];
+    static const uint8_t error_token[] = { 0x08U };
+    const uint8_t seed = 0x91U;
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    CHECK(pico_mock_sd_set_command(18U, 0x00U,
+        error_token, sizeof(error_token)));
+    CHECK(pico_mock_sd_set_command(12U, 0x00U, NULL, 0U));
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
+        block_device_read_blocks(device, 0U, failed_blocks, 2U));
+    CHECK_EQ(1U, pico_mock_sd_command_count(18U));
+    CHECK_EQ(1U, pico_mock_sd_command_count(12U));
+    CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+
+    CHECK_EQ(PAYLOAD_SIZE, make_read_payload(payload, 1U, seed));
+    CHECK(pico_mock_sd_set_command(
+        17U, 0x00U, payload, sizeof(payload)));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK,
+        block_device_read_blocks(device, 2U, recovered_block, 1U));
+    CHECK(buffer_matches(recovered_block, 1U, seed));
+    CHECK_EQ(1U, pico_mock_sd_command_count(17U));
+    CHECK_EQ(1U, pico_mock_sd_command_count(18U));
+    CHECK_EQ(1U, pico_mock_sd_command_count(12U));
+    CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+    CHECK_EQ(0U, pico_mock_sd_pending_response_count());
 }
 
 static void test_multiple_block_stop_response_timeout_is_bounded(void)
@@ -1003,7 +1247,7 @@ static void test_stop_transmission_reports_busy_timeout(void)
 static void test_error_cleanup_reports_busy_timeout(void)
 {
     uint8_t blocks[2U * SD_BLOCK_SIZE];
-    static const uint8_t error_token[] = { 0x0dU };
+    static const uint8_t error_token[] = { 0x08U };
     static uint8_t busy_response[1200];
 
     pico_mock_reset();
@@ -1011,10 +1255,10 @@ static void test_error_cleanup_reports_busy_timeout(void)
     block_device_t *const device = initialize_sdhc(&sd);
     CHECK(device != NULL);
     memset(busy_response, 0, sizeof(busy_response));
-    pico_mock_sd_set_command(18U, 0x00U,
-        error_token, sizeof(error_token));
-    pico_mock_sd_set_command(12U, 0x00U,
-        busy_response, sizeof(busy_response));
+    CHECK(pico_mock_sd_set_command(18U, 0x00U,
+        error_token, sizeof(error_token)));
+    CHECK(pico_mock_sd_set_command(12U, 0x00U,
+        busy_response, sizeof(busy_response)));
 
     CHECK_EQ(BLOCK_DEVICE_RESULT_BUSY_TIMEOUT,
         block_device_read_blocks(device, 0U, blocks, 2U));
@@ -1041,6 +1285,8 @@ int main(void)
     run_test(test_backend_context_validation,
         "backend context validation");
     run_test(test_configure_validation, "configure validation");
+    run_test(test_mock_command_configuration_validation,
+        "mock command configuration validation");
     run_test(test_configure_exposes_uninitialized_device,
         "configured device preconditions");
     run_test(test_reconfiguration_lifecycle,
@@ -1059,6 +1305,16 @@ int main(void)
         "unsupported CSD initialization rollback");
     run_test(test_cmd9_response_and_data_token_failures,
         "CMD9 response and data-token failures");
+    run_test(test_data_error_token_01_is_immediate,
+        "data-error token 0x01 is immediate");
+    run_test(test_data_error_token_02_is_immediate,
+        "data-error token 0x02 is immediate");
+    run_test(test_data_error_token_04_is_immediate,
+        "data-error token 0x04 is immediate");
+    run_test(test_data_error_token_08_is_immediate,
+        "data-error token 0x08 is immediate");
+    run_test(test_zero_is_not_a_data_error_token,
+        "zero is not a data-error token");
     run_test(test_capacity_state_cleared_across_reinitialization,
         "capacity state reinitialization lifecycle");
     run_test(test_deinit_waits_and_releases_resources,
@@ -1077,6 +1333,8 @@ int main(void)
         "multiple-block timeout");
     run_test(test_multiple_block_error_cleanup,
         "multiple-block error cleanup");
+    run_test(test_multiple_block_error_recovery,
+        "multiple-block error recovery");
     run_test(test_multiple_block_stop_response_timeout_is_bounded,
         "multiple-block stop response timeout");
     run_test(test_multiple_block_stop_waits_until_ready,

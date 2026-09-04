@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+enum {
+    PICO_MOCK_MAX_COMMAND_PAYLOAD = 4096,
+};
+
 void pico_mock_reset(void);
 
 void pico_mock_gpio_set_input(unsigned int pin, bool value);
@@ -21,7 +25,7 @@ const uint8_t *pico_mock_spi_tx_log(void);
 size_t pico_mock_sd_pending_response_count(void);
 
 void pico_mock_sd_set_busy_cycles(size_t cycles);
-void pico_mock_sd_set_command(
+bool pico_mock_sd_set_command(
     uint8_t command,
     uint8_t r1,
     const uint8_t *payload,

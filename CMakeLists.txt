@@ -44,8 +44,9 @@ if(PICO_SDK_VERSION_STRING VERSION_LESS "2.0.0")
 endif()
 
 option(TAVERNKEEP_ENABLE_LOGGING "Enable firmware log output" ON)
-option(TAVERNKEEP_STDIO_UART "Enable Pico SDK UART stdio" ON)
+option(TAVERNKEEP_STDIO_UART "Enable Pico SDK UART stdio" OFF)
 option(TAVERNKEEP_STDIO_USB "Enable Pico SDK USB CDC stdio" OFF)
+option(TAVERNKEEP_STDIO_RTT "Enable Pico SDK RTT stdio" ON)
 
 set(TAVERNKEEP_SOURCES
     src/main.c
@@ -86,6 +87,12 @@ if(TAVERNKEEP_STDIO_USB)
     pico_enable_stdio_usb(tavernkeep 1)
 else()
     pico_enable_stdio_usb(tavernkeep 0)
+endif()
+
+if(TAVERNKEEP_STDIO_RTT)
+    pico_enable_stdio_rtt(tavernkeep 1)
+else()
+    pico_enable_stdio_rtt(tavernkeep 0)
 endif()
 
 # Pico SDK sources are added to this target internally, so target-wide warning

@@ -26,6 +26,10 @@ static void sd_spi_release_bus(const sd_spi_t *sd) {
     gpio_put(sd->config.pin_chip_select, true);
     sd_spi_transfer(sd, 0xFF);
 }
+static bool sd_spi_is_data_error_token(uint8_t token) {
+    return (token & 0xF0U) == 0U
+        && (token & 0x0FU) != 0U;
+}
 static block_device_result_t sd_spi_device_init(void *context);
 static block_device_result_t sd_spi_device_deinit(void *context);
 static block_device_result_t sd_spi_device_read_blocks(
@@ -314,7 +318,7 @@ static block_device_result_t sd_spi_device_read_blocks(
                         sd_spi_transfer(sd, 0xFF);
                         sd_spi_transfer(sd, 0xFF);
                         break;
-                    } else if (((token & 0xF0) == 0x00) && (token & 0x01)) {
+                    } else if (sd_spi_is_data_error_token(token)) {
                         //data error token, issue command 12 and release bus
                         result = sd_spi_stop_transmission(sd);
                         sd_spi_release_bus(sd);
@@ -368,7 +372,7 @@ static block_device_result_t sd_spi_device_read_blocks(
                     sd_spi_transfer(sd, 0xFF);
                     break;
                 }
-                if (((token & 0xF0) == 0x00) && (token & 0x01)) {
+                if (sd_spi_is_data_error_token(token)) {
                     //data error token
                     sd_spi_release_bus(sd);
                     return BLOCK_DEVICE_RESULT_IO_ERROR;
@@ -480,7 +484,7 @@ static block_device_result_t sd_spi_read_csd(
             //data start token
             break;
         }
-        if (((token & 0xF0) == 0x00) && (token & 0x01)) {
+        if (sd_spi_is_data_error_token(token)) {
             //data error token
             return BLOCK_DEVICE_RESULT_IO_ERROR;
         }
