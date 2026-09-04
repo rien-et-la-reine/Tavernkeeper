@@ -5,6 +5,13 @@
 #include "hardware/gpio.h"
 #include "pico/time.h"
 
+enum {
+    SD_SPI_CARD_DETECT_STABLE_SAMPLES = 10,
+    SD_SPI_CARD_DETECT_MAX_SAMPLES = 30,
+    SD_SPI_CARD_DETECT_SAMPLE_INTERVAL_MS = 1,
+};
+
+static bool sd_spi_card_is_present(const sd_spi_t *sd);
 static bool sd_spi_wait_ready(const sd_spi_t *sd);
 static uint8_t sd_spi_transfer(const sd_spi_t *sd, uint8_t tx);
 static block_device_result_t sd_spi_command(
@@ -93,9 +100,11 @@ static block_device_result_t sd_spi_device_init(void *context)
     sd->card_type_hcxc = false;
     sd->block_count = 0U;
 
-    //check for card present and writeable
-    gpio_init(sd->config.pin_card_available); // external hardware pullup required
-    if (gpio_get(sd->config.pin_card_available) != 0) {
+    //select the pull-up before gpio_init enables the input buffer on RP2350
+    gpio_pull_up(sd->config.pin_card_available);
+    gpio_init(sd->config.pin_card_available);
+    gpio_set_dir(sd->config.pin_card_available, GPIO_IN);
+    if (!sd_spi_card_is_present(sd)) {
         gpio_deinit(sd->config.pin_card_available);
         return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
     }
@@ -105,7 +114,6 @@ static block_device_result_t sd_spi_device_init(void *context)
     gpio_init(sd->config.pin_chip_select);
     gpio_put(sd->config.pin_chip_select, true); //for safety to avoid accidentally asserting cs
     gpio_set_dir(sd->config.pin_chip_select, GPIO_OUT);
-    gpio_set_dir(sd->config.pin_card_available, GPIO_IN);
     gpio_set_function(sd->config.pin_clock, GPIO_FUNC_SPI);
     gpio_set_function(sd->config.pin_controller_in, GPIO_FUNC_SPI);
     gpio_set_function(sd->config.pin_controller_out, GPIO_FUNC_SPI);
@@ -568,6 +576,29 @@ static block_device_result_t sd_spi_init_rollback(
     sd->card_type_hcxc = false;
     sd->block_count = 0U;
     return result;
+}
+
+static bool sd_spi_card_is_present(const sd_spi_t *sd)
+{
+    uint8_t stable_samples = 0U;
+
+    for (uint8_t sample = 0U;
+            sample < SD_SPI_CARD_DETECT_MAX_SAMPLES; ++sample) {
+        if (!gpio_get(sd->config.pin_card_available)) {
+            stable_samples++;
+            if (stable_samples == SD_SPI_CARD_DETECT_STABLE_SAMPLES) {
+                return true;
+            }
+        } else {
+            stable_samples = 0U;
+        }
+
+        if (sample + 1U < SD_SPI_CARD_DETECT_MAX_SAMPLES) {
+            sleep_ms(SD_SPI_CARD_DETECT_SAMPLE_INTERVAL_MS);
+        }
+    }
+
+    return false;
 }
 
 static bool sd_spi_wait_ready(const sd_spi_t *sd) {

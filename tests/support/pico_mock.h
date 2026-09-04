@@ -12,7 +12,13 @@ enum {
 void pico_mock_reset(void);
 
 void pico_mock_gpio_set_input(unsigned int pin, bool value);
+bool pico_mock_gpio_set_input_sequence(
+    unsigned int pin,
+    const bool *values,
+    size_t value_count);
+size_t pico_mock_gpio_read_count(unsigned int pin);
 bool pico_mock_gpio_level(unsigned int pin);
+bool pico_mock_gpio_was_pulled_up_at_init(unsigned int pin);
 bool pico_mock_gpio_was_initialized(unsigned int pin);
 bool pico_mock_gpio_was_deinitialized(unsigned int pin);
 unsigned int pico_mock_gpio_function(unsigned int pin);

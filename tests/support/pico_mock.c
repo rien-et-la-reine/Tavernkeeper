@@ -8,6 +8,7 @@
 
 enum {
     MOCK_PIN_COUNT = 64,
+    MOCK_GPIO_INPUT_SEQUENCE_CAPACITY = 64,
     MOCK_COMMAND_COUNT = 64,
     MOCK_RESPONSE_CAPACITY = 8192,
     MOCK_TX_CAPACITY = 16384,
@@ -23,10 +24,17 @@ typedef struct {
 } mock_command_t;
 
 static bool gpio_levels[MOCK_PIN_COUNT];
+static bool gpio_pull_ups[MOCK_PIN_COUNT];
+static bool gpio_pulled_up_at_init[MOCK_PIN_COUNT];
 static bool gpio_initialized[MOCK_PIN_COUNT];
 static bool gpio_deinitialized[MOCK_PIN_COUNT];
 static bool gpio_directions[MOCK_PIN_COUNT];
 static unsigned int gpio_functions[MOCK_PIN_COUNT];
+static size_t gpio_read_counts[MOCK_PIN_COUNT];
+static bool gpio_input_sequence[MOCK_GPIO_INPUT_SEQUENCE_CAPACITY];
+static size_t gpio_input_sequence_size;
+static size_t gpio_input_sequence_position;
+static unsigned int gpio_input_sequence_pin;
 
 static bool spi_initialized;
 static unsigned int spi_initial_baudrate;
@@ -132,10 +140,17 @@ static uint8_t transfer_byte(uint8_t tx)
 void pico_mock_reset(void)
 {
     memset(gpio_levels, 0, sizeof(gpio_levels));
+    memset(gpio_pull_ups, 0, sizeof(gpio_pull_ups));
+    memset(gpio_pulled_up_at_init, 0, sizeof(gpio_pulled_up_at_init));
     memset(gpio_initialized, 0, sizeof(gpio_initialized));
     memset(gpio_deinitialized, 0, sizeof(gpio_deinitialized));
     memset(gpio_directions, 0, sizeof(gpio_directions));
     memset(gpio_functions, 0, sizeof(gpio_functions));
+    memset(gpio_read_counts, 0, sizeof(gpio_read_counts));
+    memset(gpio_input_sequence, 0, sizeof(gpio_input_sequence));
+    gpio_input_sequence_size = 0U;
+    gpio_input_sequence_position = 0U;
+    gpio_input_sequence_pin = MOCK_PIN_COUNT;
     spi_initialized = false;
     spi_initial_baudrate = 0U;
     spi_baudrate = 0U;
@@ -158,9 +173,39 @@ void pico_mock_gpio_set_input(unsigned int pin, bool value)
     }
 }
 
+bool pico_mock_gpio_set_input_sequence(
+    unsigned int pin,
+    const bool *values,
+    size_t value_count)
+{
+    if (!valid_pin(pin)
+            || value_count > MOCK_GPIO_INPUT_SEQUENCE_CAPACITY
+            || (value_count != 0U && values == NULL)) {
+        return false;
+    }
+
+    gpio_input_sequence_pin = pin;
+    gpio_input_sequence_size = value_count;
+    gpio_input_sequence_position = 0U;
+    if (value_count != 0U) {
+        memcpy(gpio_input_sequence, values, value_count * sizeof(values[0]));
+    }
+    return true;
+}
+
+size_t pico_mock_gpio_read_count(unsigned int pin)
+{
+    return valid_pin(pin) ? gpio_read_counts[pin] : 0U;
+}
+
 bool pico_mock_gpio_level(unsigned int pin)
 {
     return valid_pin(pin) && gpio_levels[pin];
+}
+
+bool pico_mock_gpio_was_pulled_up_at_init(unsigned int pin)
+{
+    return valid_pin(pin) && gpio_pulled_up_at_init[pin];
 }
 
 bool pico_mock_gpio_was_initialized(unsigned int pin)
@@ -250,6 +295,7 @@ uint32_t pico_mock_sd_last_argument(uint8_t command)
 void gpio_init(unsigned int pin)
 {
     if (valid_pin(pin)) {
+        gpio_pulled_up_at_init[pin] = gpio_pull_ups[pin];
         gpio_initialized[pin] = true;
         gpio_deinitialized[pin] = false;
     }
@@ -263,6 +309,13 @@ void gpio_deinit(unsigned int pin)
     }
 }
 
+void gpio_pull_up(unsigned int pin)
+{
+    if (valid_pin(pin)) {
+        gpio_pull_ups[pin] = true;
+    }
+}
+
 void gpio_put(unsigned int pin, bool value)
 {
     if (valid_pin(pin)) {
@@ -272,7 +325,16 @@ void gpio_put(unsigned int pin, bool value)
 
 bool gpio_get(unsigned int pin)
 {
-    return valid_pin(pin) && gpio_levels[pin];
+    if (!valid_pin(pin)) {
+        return false;
+    }
+
+    gpio_read_counts[pin]++;
+    if (pin == gpio_input_sequence_pin
+            && gpio_input_sequence_position < gpio_input_sequence_size) {
+        return gpio_input_sequence[gpio_input_sequence_position++];
+    }
+    return gpio_levels[pin];
 }
 
 void gpio_set_dir(unsigned int pin, bool out)

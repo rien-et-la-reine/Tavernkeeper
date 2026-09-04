@@ -489,6 +489,8 @@ static void test_sdhc_initialization(void)
     CHECK_EQ(OPERATIONAL_BAUDRATE, pico_mock_spi_baudrate());
     CHECK(pico_mock_gpio_was_initialized(PIN_CHIP_SELECT));
     CHECK(pico_mock_gpio_was_initialized(PIN_CARD_AVAILABLE));
+    CHECK(pico_mock_gpio_was_pulled_up_at_init(PIN_CARD_AVAILABLE));
+    CHECK_EQ(10U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
     CHECK_EQ(GPIO_FUNC_SPI, pico_mock_gpio_function(PIN_CLOCK));
     CHECK_EQ(GPIO_FUNC_SPI, pico_mock_gpio_function(PIN_CONTROLLER_OUT));
     CHECK_EQ(GPIO_FUNC_SPI, pico_mock_gpio_function(PIN_CONTROLLER_IN));
@@ -584,6 +586,47 @@ static void test_missing_card_fails_initialization(void)
     CHECK(!sd.initialized);
     CHECK_EQ(0U, pico_mock_sd_command_count(0U));
     CHECK(!pico_mock_spi_is_initialized());
+    CHECK(pico_mock_gpio_was_deinitialized(PIN_CARD_AVAILABLE));
+    CHECK_EQ(30U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
+}
+
+static void test_card_detect_debounce(void)
+{
+    static const bool settles_present[] = {
+        false, false, true, false, true,
+        false, false, false, false, false,
+        false, false, false, false, false,
+    };
+    static const bool never_stable[] = {
+        false, false, false, false, false, false, false, false, false, true,
+        false, false, false, false, false, false, false, false, false, true,
+        false, false, false, false, false, false, false, false, false, true,
+    };
+    const sd_spi_config_t config = valid_config();
+    sd_spi_t sd = { 0 };
+
+    pico_mock_reset();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    configure_successful_sdhc_card();
+    CHECK(pico_mock_gpio_set_input_sequence(PIN_CARD_AVAILABLE,
+        settles_present, sizeof(settles_present) / sizeof(settles_present[0])));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(sd.initialized);
+    CHECK_EQ(15U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
+    CHECK(pico_mock_spi_is_initialized());
+
+    pico_mock_reset();
+    memset(&sd, 0, sizeof(sd));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    CHECK(pico_mock_gpio_set_input_sequence(PIN_CARD_AVAILABLE,
+        never_stable, sizeof(never_stable) / sizeof(never_stable[0])));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(!sd.initialized);
+    CHECK_EQ(30U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_spi_is_initialized());
+    CHECK_EQ(0U, pico_mock_sd_command_count(0U));
     CHECK(pico_mock_gpio_was_deinitialized(PIN_CARD_AVAILABLE));
 }
 
@@ -1297,6 +1340,7 @@ int main(void)
         "CSD capacity encoding limits");
     run_test(test_missing_card_fails_initialization,
         "missing card initialization failure");
+    run_test(test_card_detect_debounce, "card-detect debounce");
     run_test(test_card_initialization_timeout_is_bounded,
         "card initialization timeout");
     run_test(test_initialization_response_validation,
