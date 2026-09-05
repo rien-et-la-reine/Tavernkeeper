@@ -4,6 +4,7 @@
 
 #include "hardware/gpio.h"
 #include "pico/time.h"
+#include "platform/gpio_irq.h"
 
 enum {
     SD_SPI_CARD_DETECT_STABLE_SAMPLES = 10,
@@ -11,7 +12,14 @@ enum {
     SD_SPI_CARD_DETECT_SAMPLE_INTERVAL_MS = 1,
 };
 
-static bool sd_spi_card_is_present(const sd_spi_t *sd);
+static bool sd_spi_card_available(const sd_spi_t *sd);
+static void sd_spi_card_available_irq(
+    void *context,
+    unsigned int gpio,
+    uint32_t events
+);
+static bool sd_spi_removal_latched(const sd_spi_t *sd);
+static block_device_result_t sd_spi_require_usable(const sd_spi_t *sd);
 static bool sd_spi_wait_ready(const sd_spi_t *sd);
 static uint8_t sd_spi_transfer(const sd_spi_t *sd, uint8_t tx);
 static block_device_result_t sd_spi_command(
@@ -31,7 +39,9 @@ static void sd_spi_capture_bus(const sd_spi_t *sd) {
 }
 static void sd_spi_release_bus(const sd_spi_t *sd) {
     gpio_put(sd->config.pin_chip_select, true);
-    sd_spi_transfer(sd, 0xFF);
+    if (!sd_spi_removal_latched(sd)) {
+        sd_spi_transfer(sd, 0xFF);
+    }
 }
 static bool sd_spi_is_data_error_token(uint8_t token) {
     return (token & 0xF0U) == 0U
@@ -77,6 +87,9 @@ block_device_result_t sd_spi_configure(
     sd->block_device.context = sd;
     sd->block_device.operations = &sd_spi_operations;
 
+    //unlatch the removal flag
+    atomic_init(&sd->removal_latched, false);
+
     return BLOCK_DEVICE_RESULT_OK;
 }
 
@@ -102,9 +115,36 @@ static block_device_result_t sd_spi_device_init(void *context)
 
     //select the pull-up before gpio_init enables the input buffer on RP2350
     gpio_pull_up(sd->config.pin_card_available);
+    //setup the card detect/write protect pin (again, validate hardware slot's truth table to ensure WP can serve both functions)
     gpio_init(sd->config.pin_card_available);
     gpio_set_dir(sd->config.pin_card_available, GPIO_IN);
-    if (!sd_spi_card_is_present(sd)) {
+    //check that a non write protected card is present, with debouncing
+    if (!sd_spi_card_available(sd)) {
+        gpio_deinit(sd->config.pin_card_available);
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
+
+    //clear the latch
+    atomic_store_explicit(&sd->removal_latched, false, memory_order_relaxed);
+
+    //register the rising edge interrupt
+    if (!platform_gpio_irq_register(
+            sd->config.pin_card_available,
+            GPIO_IRQ_EDGE_RISE,
+            sd_spi_card_available_irq,
+            sd)) {
+        gpio_deinit(sd->config.pin_card_available);
+        return BLOCK_DEVICE_RESULT_IO_ERROR;
+    }
+
+    //handle removal after the debounced presence check but before registration;
+    //the latch also catches an edge that bounced low before this level check
+    const bool card_unavailable = gpio_get(sd->config.pin_card_available);
+    if (card_unavailable) {
+        atomic_store_explicit(&sd->removal_latched, true, memory_order_relaxed);
+    }
+    if (card_unavailable || sd_spi_removal_latched(sd)) {
+        platform_gpio_irq_unregister(sd->config.pin_card_available);
         gpio_deinit(sd->config.pin_card_available);
         return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
     }
@@ -121,10 +161,16 @@ static block_device_result_t sd_spi_device_init(void *context)
     //cs high
     gpio_put(sd->config.pin_chip_select, true);
     sleep_ms(1);
+    if (sd_spi_removal_latched(sd)) {
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_INVALID_DEVICE);
+    }
     //mosi high, 80 clock cycles
     for (uint8_t i = 0; i < 10; i++)
     {
         sd_spi_transfer(sd, 0xFF);
+        if (sd_spi_removal_latched(sd)) {
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_INVALID_DEVICE);
+        }
     }
     //cs low
     sd_spi_capture_bus(sd);
@@ -154,6 +200,9 @@ static block_device_result_t sd_spi_device_init(void *context)
         }
         if (sd_spi_transfer(sd, 0xFF) != 0xAA) { 
             return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
+        }
+        if (sd_spi_removal_latched(sd)) {
+            return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_INVALID_DEVICE);
         }
     } else if (r1 == 0x05) {
         //card type is v1
@@ -200,6 +249,9 @@ static block_device_result_t sd_spi_device_init(void *context)
     sd_spi_transfer(sd, 0xFF);
     sd_spi_transfer(sd, 0xFF);
     sd_spi_transfer(sd, 0xFF);
+    if (sd_spi_removal_latched(sd)) {
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_INVALID_DEVICE);
+    }
     if ((ocr_msb & 0x80) != 0x80) {
         //not powered up for some reason
         return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_IO_ERROR);
@@ -224,8 +276,15 @@ static block_device_result_t sd_spi_device_init(void *context)
         }
     }
 
+    if (sd_spi_removal_latched(sd)) {
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_INVALID_DEVICE);
+    }
+
     //cs deassert and trailing clocks
     sd_spi_release_bus(sd);
+    if (sd_spi_removal_latched(sd)) {
+        return sd_spi_init_rollback(sd, BLOCK_DEVICE_RESULT_INVALID_DEVICE);
+    }
     
     //move to operational baud rate
     spi_set_baudrate(sd->config.spi, sd->config.baud_rate_hz);
@@ -244,9 +303,18 @@ static block_device_result_t sd_spi_device_deinit(void *context)
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
 
-    if (sd->initialized) {
+    /* Every initialization path that fails releases what it acquired, so an
+     * uninitialized device owns no SPI or GPIO resources. Releasing them again
+     * would take the peripheral away from whatever owns it now and would break
+     * the exactly-once teardown the architecture requires of the removal path.
+     * Teardown therefore stays idempotent by doing nothing here. */
+    if (!sd->initialized) {
+        return BLOCK_DEVICE_RESULT_OK;
+    }
+
+    if (!sd_spi_removal_latched(sd)) {
         sd_spi_capture_bus(sd);
-        if (!sd_spi_wait_ready(sd)) {
+        if (!sd_spi_wait_ready(sd) && !sd_spi_removal_latched(sd)) {
             sd_spi_release_bus(sd);
             return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
         }
@@ -255,6 +323,7 @@ static block_device_result_t sd_spi_device_deinit(void *context)
         gpio_put(sd->config.pin_chip_select, true);
     }
 
+    (void)platform_gpio_irq_unregister(sd->config.pin_card_available);
     spi_deinit(sd->config.spi);
     gpio_deinit(sd->config.pin_clock);
     gpio_deinit(sd->config.pin_controller_out);
@@ -281,8 +350,9 @@ static block_device_result_t sd_spi_device_read_blocks(
     if (sd == NULL || !sd->configured || buffer == NULL || block_count == 0U) {
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
-    if (!sd->initialized) {
-        return BLOCK_DEVICE_RESULT_NOT_INITIALIZED;
+    const block_device_result_t usability = sd_spi_require_usable(sd);
+    if (usability != BLOCK_DEVICE_RESULT_OK) {
+        return usability;
     }
     if (first_lba >= sd->block_count
             || (uint64_t)block_count > sd->block_count - first_lba) {
@@ -317,19 +387,34 @@ static block_device_result_t sd_spi_device_read_blocks(
                 absolute_time_t timeout = make_timeout_time_ms(100);
                 do {
                     token = sd_spi_transfer(sd, 0xFF);
+                    if (sd_spi_removal_latched(sd)) {
+                        sd_spi_release_bus(sd);
+                        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                    }
                     if (token == 0xFE) {
                         //data response token, read in block to buffer and discard 2 byte crc
                         for (uint16_t i = 0; i < 512; i++) {
                             *buf++ = sd_spi_transfer(sd, 0xFF);
+                            if (sd_spi_removal_latched(sd)) {
+                                sd_spi_release_bus(sd);
+                                return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                            }
                         }
-                        //discard CRC
+                        //discard CRC TODO: don't discard CRC, check it
                         sd_spi_transfer(sd, 0xFF);
                         sd_spi_transfer(sd, 0xFF);
+                        if (sd_spi_removal_latched(sd)) {
+                            sd_spi_release_bus(sd);
+                            return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                        }
                         break;
                     } else if (sd_spi_is_data_error_token(token)) {
                         //data error token, issue command 12 and release bus
                         result = sd_spi_stop_transmission(sd);
                         sd_spi_release_bus(sd);
+                        if (result == BLOCK_DEVICE_RESULT_INVALID_DEVICE) {
+                            return result;
+                        }
                         if (result == BLOCK_DEVICE_RESULT_BUSY_TIMEOUT) {
                             return result;
                         }
@@ -341,8 +426,16 @@ static block_device_result_t sd_spi_device_read_blocks(
                 }
             } while (--block_count);
 
+            if (sd_spi_removal_latched(sd)) {
+                sd_spi_release_bus(sd);
+                return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+            }
             result = sd_spi_stop_transmission(sd);
             sd_spi_release_bus(sd);
+            //a removal edge during the release clocks still cancels the transfer
+            if (sd_spi_removal_latched(sd)) {
+                return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+            }
             if (result != BLOCK_DEVICE_RESULT_OK) {
                 return result;
             }
@@ -353,7 +446,9 @@ static block_device_result_t sd_spi_device_read_blocks(
         //an error occurred before CMD18 entered the data-transfer state
         if (!sd_spi_wait_ready(sd)) {
             sd_spi_release_bus(sd);
-            return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
+            return sd_spi_removal_latched(sd)
+                ? BLOCK_DEVICE_RESULT_INVALID_DEVICE
+                : BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
         }
         sd_spi_release_bus(sd);
         return BLOCK_DEVICE_RESULT_IO_ERROR;
@@ -370,14 +465,26 @@ static block_device_result_t sd_spi_device_read_blocks(
             absolute_time_t timeout = make_timeout_time_ms(100);
             do {
                 token = sd_spi_transfer(sd, 0xFF);
+                if (sd_spi_removal_latched(sd)) {
+                    sd_spi_release_bus(sd);
+                    return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                }
                 if (token == 0xFE) {
                     //data response token, read in block to buffer and discard 2 byte crc
                     for (uint16_t i = 0; i < 512; i++) {
                         *buf++ = sd_spi_transfer(sd, 0xFF);
+                        if (sd_spi_removal_latched(sd)) {
+                            sd_spi_release_bus(sd);
+                            return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                        }
                     }
-                    //discard CRC
+                    //discard CRC, TODO: check and validate CRC instead of discarding
                     sd_spi_transfer(sd, 0xFF);
                     sd_spi_transfer(sd, 0xFF);
+                    if (sd_spi_removal_latched(sd)) {
+                        sd_spi_release_bus(sd);
+                        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                    }
                     break;
                 }
                 if (sd_spi_is_data_error_token(token)) {
@@ -390,6 +497,10 @@ static block_device_result_t sd_spi_device_read_blocks(
             if (token == 0xFE) {
                 //did not time out
                 sd_spi_release_bus(sd);
+                //a removal edge during the release clocks still cancels the transfer
+                if (sd_spi_removal_latched(sd)) {
+                    return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+                }
                 return BLOCK_DEVICE_RESULT_OK;
             }
         }
@@ -414,11 +525,13 @@ static block_device_result_t sd_spi_device_write_blocks(
     if (sd == NULL || !sd->configured) {
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
-    if (!sd->initialized) {
-        return BLOCK_DEVICE_RESULT_NOT_INITIALIZED;
+    const block_device_result_t usability = sd_spi_require_usable(sd);
+    if (usability != BLOCK_DEVICE_RESULT_OK) {
+        return usability;
     }
 
-    /* TODO(owner): Implement bounded-time SD SPI block writes. */
+    /* TODO(owner): Implement bounded-time SD SPI block writes, preserving the
+     * sd_spi_require_usable() check at each operation entry. */
     return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
 }
 
@@ -432,17 +545,23 @@ static block_device_result_t sd_spi_device_get_info(
     if (sd == NULL || !sd->configured) {
         return BLOCK_DEVICE_RESULT_INVALID_ARGUMENT;
     }
-    if (!sd->initialized) {
-        return BLOCK_DEVICE_RESULT_NOT_INITIALIZED;
+    const block_device_result_t usability = sd_spi_require_usable(sd);
+    if (usability != BLOCK_DEVICE_RESULT_OK) {
+        return usability;
     }
 
-    /* TODO(owner): Report capacity parsed from the card CSD register. */
+    /* TODO(owner): Report capacity parsed from the card CSD register,
+     * preserving the sd_spi_require_usable() check at each operation entry. */
     return BLOCK_DEVICE_RESULT_NOT_IMPLEMENTED;
 }
 
 // The caller owns the captured bus and remains responsible for releasing it.
 static block_device_result_t sd_spi_stop_transmission(const sd_spi_t *sd)
 {
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
+
     // CMD12 must be sent while the card is still in the active CMD18 state.
     sd_spi_transfer(sd, 12U | 0x40U);
     sd_spi_transfer(sd, 0x00U);
@@ -450,19 +569,30 @@ static block_device_result_t sd_spi_stop_transmission(const sd_spi_t *sd)
     sd_spi_transfer(sd, 0x00U);
     sd_spi_transfer(sd, 0x00U);
     sd_spi_transfer(sd, 0x01U);
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
 
     // CMD12 has one positional stuff byte before its R1 response in SPI mode.
     sd_spi_transfer(sd, 0xFFU);
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
 
     uint8_t r1 = 0xFFU;
     for (uint8_t i = 0U; i < 8U; ++i) {
         r1 = sd_spi_transfer(sd, 0xFFU);
+        if (sd_spi_removal_latched(sd)) {
+            return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+        }
         if ((r1 & 0x80U) == 0U) {
             break;
         }
     }
     if (!sd_spi_wait_ready(sd)) {
-        return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
+        return sd_spi_removal_latched(sd)
+            ? BLOCK_DEVICE_RESULT_INVALID_DEVICE
+            : BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
     }
     return r1 == 0x00U
         ? BLOCK_DEVICE_RESULT_OK
@@ -488,6 +618,9 @@ static block_device_result_t sd_spi_read_csd(
     absolute_time_t timeout = make_timeout_time_ms(100);
     do {
         token = sd_spi_transfer(sd, 0xFF);
+        if (sd_spi_removal_latched(sd)) {
+            return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+        }
         if (token == 0xFE) {
             //data start token
             break;
@@ -506,10 +639,16 @@ static block_device_result_t sd_spi_read_csd(
     uint8_t csd[16];
     for (size_t i = 0U; i < sizeof(csd); ++i) {
         csd[i] = sd_spi_transfer(sd, 0xFF);
+        if (sd_spi_removal_latched(sd)) {
+            return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+        }
     }
     //discard crc
     sd_spi_transfer(sd, 0xFF);
     sd_spi_transfer(sd, 0xFF);
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
 
     //check csd structure to determine version (version 1.0 for sdsc and 2.0 for sdhc/sdxc. sduc not supported)
     const uint8_t csd_structure = (uint8_t)(csd[0] >> 6U);
@@ -564,6 +703,7 @@ static block_device_result_t sd_spi_init_rollback(
     sd_spi_t *sd,
     block_device_result_t result)
 {
+    (void)platform_gpio_irq_unregister(sd->config.pin_card_available);
     sd_spi_release_bus(sd);
     spi_deinit(sd->config.spi);
     gpio_deinit(sd->config.pin_clock);
@@ -578,7 +718,7 @@ static block_device_result_t sd_spi_init_rollback(
     return result;
 }
 
-static bool sd_spi_card_is_present(const sd_spi_t *sd)
+static bool sd_spi_card_available(const sd_spi_t *sd)
 {
     uint8_t stable_samples = 0U;
 
@@ -601,10 +741,57 @@ static bool sd_spi_card_is_present(const sd_spi_t *sd)
     return false;
 }
 
+static void sd_spi_card_available_irq(
+    void *context,
+    unsigned int gpio,
+    uint32_t events)
+{
+    //pull the sd card object
+    sd_spi_t *const sd = context;
+
+    //if sd card object does not exist, the triggering gpio is not it's card detect/write protect pin, or the triggering event was not a rising edge, do nothing
+    if (sd == NULL
+            || gpio != sd->config.pin_card_available
+            || (events & GPIO_IRQ_EDGE_RISE) == 0U) {
+        return;
+    }
+
+    //set the card removal latch; a fresh initialization attempt may clear it
+    atomic_store_explicit(&sd->removal_latched, true, memory_order_relaxed);
+
+    //supress repeated triggers and bouncing, will be rearmed at fresh initialization
+    platform_gpio_irq_set_enabled(gpio, false);
+}
+
+static bool sd_spi_removal_latched(const sd_spi_t *sd)
+{
+    return atomic_load_explicit(
+        &sd->removal_latched, memory_order_relaxed);
+}
+
+static block_device_result_t sd_spi_require_usable(const sd_spi_t *sd) {
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
+
+    if (!sd->initialized) {
+        return BLOCK_DEVICE_RESULT_NOT_INITIALIZED;
+    }
+
+    return BLOCK_DEVICE_RESULT_OK;
+}
+
 static bool sd_spi_wait_ready(const sd_spi_t *sd) {
     absolute_time_t timeout = make_timeout_time_ms(1000);
     while (!time_reached(timeout)) {
-        if (sd_spi_transfer(sd, 0xFF) == 0xFF) {
+        if (sd_spi_removal_latched(sd)) {
+            return false;
+        }
+        const uint8_t response = sd_spi_transfer(sd, 0xFF);
+        if (sd_spi_removal_latched(sd)) {
+            return false;
+        }
+        if (response == 0xFF) {
             return true;
         }
     }
@@ -627,9 +814,15 @@ static block_device_result_t sd_spi_command(
     uint8_t i = 0;
     uint8_t response;
 
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
+
     //ensure card is ready and preserve a distinct busy-timeout result
     if (!sd_spi_wait_ready(sd)) {
-        return BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
+        return sd_spi_removal_latched(sd)
+            ? BLOCK_DEVICE_RESULT_INVALID_DEVICE
+            : BLOCK_DEVICE_RESULT_BUSY_TIMEOUT;
     }
     //send command index cmd
     sd_spi_transfer(sd, cmd | 0x40);
@@ -646,12 +839,21 @@ static block_device_result_t sd_spi_command(
     } else {
         sd_spi_transfer(sd, 0x00|0x01);
     }
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+    }
     //wait for R1 response
     while (((response = sd_spi_transfer(sd, 0xFF)) & 0x80) == 0x80) {
+        if (sd_spi_removal_latched(sd)) {
+            return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
+        }
         i++;
         if (i > 7) {
             return BLOCK_DEVICE_RESULT_IO_ERROR;
         }
+    }
+    if (sd_spi_removal_latched(sd)) {
+        return BLOCK_DEVICE_RESULT_INVALID_DEVICE;
     }
     *r1 = response;
     return BLOCK_DEVICE_RESULT_OK;

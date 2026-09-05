@@ -246,6 +246,8 @@ Future ownership rules will be required for:
 
 - shared buffers
 
+- logical removable-media availability and cancellation of storage consumers
+
 - display resources
 
 - audio buffers and peripherals
@@ -255,6 +257,56 @@ Future ownership rules will be required for:
 - switchable peripheral power domains
 
 These have not yet been assigned.
+
+## Removable-Media Detection and Hot Removal
+
+**Availability signal and debounce**
+
+The final socket presents card-detect and write-protect information through one active-low availability signal. A low level means usable media may be present; a high level means the storage device must be treated as unavailable, whether the physical cause is card removal or write protection.
+
+The current SPI backend debounces its preliminary initialization check before touching the SD bus. It requires ten consecutive low samples taken one millisecond apart within a maximum of thirty samples. The pad's internal pull-up is selected before GPIO initialization enables the input buffer. The board-level external pull-up remains required to define the signal before firmware begins executing and while the RP2350 pad is still in its reset state.
+
+A future hot-removal interrupt should use the rising edge rather than a continuously asserted high-level interrupt. The first edge must conservatively make storage unavailable immediately. Further events may be disabled while foreground code confirms a sustained high level, preventing mechanical contact bounce from producing an interrupt storm. A transaction interrupted by even an unconfirmed removal edge must fail and must not resume; if the signal settles low again, the card must be reinitialized before further access.
+
+**Interrupt and foreground responsibilities**
+
+Hot removal uses a two-phase shutdown. The interrupt handler performs only bounded emergency actions, while a storage coordinator performs protocol-independent cancellation and resource teardown in foreground context.
+
+| Immediate interrupt work | Deferred foreground work |
+| --- | --- |
+| Latch media unavailable and transfer cancelled | Cancel cooperative storage consumers |
+| Prevent new block operations | Invalidate filesystem state and open media handles |
+| Suppress duplicate card-detect events during debounce | Wait for any interrupted backend operation to unwind |
+| Quiesce non-blocking autonomous transfer hardware when required | Abort and reset transfer engines safely |
+| Mask related completion interrupts when required | Release DMA, PIO, SPI, GPIO, and buffer ownership |
+
+The card-detect interrupt handler must not mount or unmount a filesystem, perform SD commands, wait for a peripheral, sleep, log, allocate memory, acquire a blocking lock, or call normal device deinitialization. In particular, it must not deinitialize a peripheral while interrupted foreground code may still be using that peripheral.
+
+Tavernkeep does not use an RTOS, so "terminating processes" means cooperative cancellation of subsystems with outstanding storage work. The physical SD backend cannot enumerate filesystem, book, audio, display, or USB consumers; a higher-level storage coordinator must own that cancellation policy.
+
+**Block-device and filesystem behavior**
+
+Once removal is latched, new block operations must return INVALID_DEVICE without touching the bus. Synchronous operations already in progress must check the removal state within bounded wait loops and transfer loops so that they unwind promptly rather than waiting for their normal protocol timeout.
+
+An interrupted read buffer is entirely invalid, regardless of how many bytes or blocks were transferred before removal. This follows the block-device contract that the requested destination contents are unspecified after any non-successful read. A late transfer-completion event must never change a cancelled request into success.
+
+Surprise removal is not a clean filesystem unmount. Higher layers must invalidate cached state and open handles without attempting to flush data to an absent card. Once write support exists, firmware can limit further damage but cannot guarantee that an interrupted write left either the filesystem or the card contents consistent.
+
+Normal deinitialization and removal teardown have different semantics. Normal deinitialization may communicate with a present card and wait for it to become ready. Removal teardown must be idempotent, must not send SD commands or poll the absent card, and must release local hardware resources after the interrupted operation has stopped. If removal occurs during a multi-block transfer, no CMD12 is sent to the absent card.
+
+**Future PIO and DMA backend**
+
+PIO state machines and DMA channels continue independently while the processor services a GPIO interrupt. A future PIO SD backend must therefore have an explicit cancellation path; setting a software flag alone does not immediately stop bus activity or memory transfers.
+
+The removal ISR may latch cancellation, disable the affected PIO state machine, and mask the associated DMA completion interrupt because those are bounded register operations. It should not call `dma_channel_abort()`, which waits until the channel reaches a safe stopped state. Foreground cleanup must disable the active DMA channel and every chained channel before aborting them, as required by RP2350-E5, then acknowledge pending or late DMA interrupts, clear or restart the PIO state machines and FIFOs, place bus pins in safe states, and release owned resources. See the Pico SDK documentation for [`dma_channel_abort()`](https://www.raspberrypi.com/documentation/pico-sdk/hardware.html) and its RP2350 errata note.
+
+Removal, DMA completion, and chained-channel activation can race. The backend should use an explicit transfer state or generation identifier so both GPIO and DMA handlers can distinguish ACTIVE, CANCEL_REQUESTED, QUIESCED, and completed transfers. Completion handlers must check cancellation before publishing results. If storage work later spans both RP2350 cores, the shared removal and transfer state must use appropriate atomic or critical-section protection.
+
+The Pico SDK generic GPIO callback is shared by all ordinary GPIO interrupts on a core. Card detection must therefore participate in a central GPIO dispatcher or use an independent raw shared handler rather than silently replacing another subsystem's callback. GPIO IRQ enablement and callback ownership must remain on the intended core.
+
+**Verification requirements**
+
+Host and hardware tests for hot removal should cover idle removal, removal during initialization, bounded waits, individual block transfer, multi-block transfer, and future PIO/DMA activity. They should verify that the ISR performs no blocking cleanup, new operations are rejected immediately, partial buffers are never consumed, teardown happens exactly once, bounce is idempotent, late completion IRQs cannot report success, chained DMA cannot retrigger, and reinsertion requires a fresh initialization.
 
 ## Error Handling Philosophy
 
@@ -389,6 +441,8 @@ The final socket's write-protect switching is used as one firmware-visible avail
 
 An external pull-up is provided for this signal.
 
+The SPI backend also selects the RP2350 pad's internal pull-up before enabling the GPIO input and applies bounded software debounce to its initial availability check. The external pull-up remains necessary because software cannot alter the pad state before firmware executes.
+
 **Displays**
 
 Tome uses two e-ink displays.
@@ -467,7 +521,7 @@ SPI support is intended to remain useful for hardware bring-up even after the 4-
 
 After the polling SD implementation has been validated, bulk block transfers are planned to use DMA.
 
-The exact asynchronous API and DMA ownership model have not yet been designed.
+The exact asynchronous API and DMA ownership model have not yet been designed. They must implement the cancellation, IRQ ordering, buffer invalidation, RP2350-E5 abort sequence, and resource-release rules described in Removable-Media Detection and Hot Removal.
 
 **Filesystem integration**
 

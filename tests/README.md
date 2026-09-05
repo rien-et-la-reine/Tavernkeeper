@@ -1,31 +1,99 @@
 # Host tests
 
-The host test target compiles the production `src/storage/sd_spi.c` against
-small Pico SDK fakes. No Pico SDK installation or physical SD card is needed.
-
-Configure, build, and run from the repository root:
+These compile production C against small Pico SDK fakes. No SDK, card, download
+or firmware build is needed. Requirements: a C11 host compiler with atomics,
+CMake 3.16+ and a build tool. Verified with GCC 13.3 on Linux and GCC 15.2 /
+MinGW on Windows; MSVC has not been validated.
 
 ```sh
-cmake -S tests -B build-host-tests
-cmake --build build-host-tests
-ctest --test-dir build-host-tests --output-on-failure
+cmake -S tests -B tests/build -DCMAKE_BUILD_TYPE=Release
+cmake --build tests/build
+ctest --test-dir tests/build --output-on-failure
 ```
 
-On Windows with MSYS2/MinGW installed but not already on `PATH`, use:
+On Windows with MSYS2/MinGW installed but not on `PATH`:
 
 ```powershell
 $env:Path = 'C:\msys64\mingw64\bin;C:\msys64\usr\bin;' + $env:Path
-cmake -S tests -B build-host-tests -G "Unix Makefiles" `
+cmake -S tests -B tests/build -G "Unix Makefiles" `
     -DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe `
-    -DCMAKE_MAKE_PROGRAM=C:/msys64/usr/bin/make.exe
-cmake --build build-host-tests
-ctest --test-dir build-host-tests --output-on-failure
+    -DCMAKE_MAKE_PROGRAM=C:/msys64/usr/bin/make.exe `
+    -DCMAKE_BUILD_TYPE=Release
+cmake --build tests/build -j 4
+ctest --test-dir tests/build --output-on-failure
 ```
 
-The fake SD card records commands and supplies configurable R1/payload bytes.
-The suite covers public and backend preconditions, configuration, SDHC and
-legacy initialization, initialization failures and timeouts, deinitialization,
-CMD17/CMD18 reads and their error cleanup, address conversion, and the current
-`NOT_IMPLEMENTED` contracts for writes and CSD-backed device information.
-Future write-path tests can inspect the TX log and extend the fake with
-data-response tokens when that protocol is added.
+Generated files stay inside `tests`. There are **22 enabled CTest cases** and
+three disabled ones for gaps that are still open. Checks remain active under
+`NDEBUG`; every case has a real-time timeout.
+
+## Where to look
+
+| Document | For |
+| --- | --- |
+| [HARNESS.md](HARNESS.md) | **start here to add or change a test** — what the harness can represent and how to use it |
+| [AUDIT.md](AUDIT.md) | what the previous harness could not detect and what replaced it |
+| [PROTOCOL.md](PROTOCOL.md) | the specification rules the tests encode, with sources |
+| [MUTATION.md](MUTATION.md) | evidence that the suite detects deliberate bugs |
+| [KNOWN_GAPS.md](KNOWN_GAPS.md) | production gaps that are still open |
+| [RESIDUAL_RISK.md](RESIDUAL_RISK.md) | what host testing cannot prove |
+| [VALIDATION_PLAN.md](VALIDATION_PLAN.md) | acceptance criteria for functionality not yet written |
+| [VALIDATION_RESULTS.md](VALIDATION_RESULTS.md) | recorded build, test, sanitizer and coverage results |
+
+## Suites
+
+| Suite | Behaviour checked |
+| --- | --- |
+| `sd_spi_host_tests` | 60 groups: SDHC/legacy/v2 SDSC, ACMD41 retries, CSD capacities and rejection, SPI framing, R1 byte limits, all error tokens, reads, canaries, address limits, cleanup, IRQ races, removal sweeps, explicit write/info stubs. Run twice, once under each clock model |
+| `sd_protocol_host_tests` | card variant matrix, command ordering, CRC7, application commands, HCS, the R1 poll boundary, all 128 R1 values, all error tokens, long multiple-block reads, addressing per card type, capacity boundaries, CSD registers from real cards, 74-clock bring-up, bus release after every outcome |
+| `sd_faults_host_tests` | fault injection across every read phase, error after partial success, CMD12 failure after good data, bounded busy periods, removal at each phase and during the release clock, OCR power-up status, reinsertion, the data-CRC gap |
+| `sd_property_host_tests` | CSD arithmetic across all field encodings, the largest addressable card, address conversion on random cards, random card responses, random operation and removal sequences. Seeded; prints its seed and takes `--seed N` |
+| `sd_removal_*_host_tests` | regressions for the two production defects fixed during the test overhaul |
+| `gpio_irq_host_tests` | ownership and core rules, validation, routing and masking, multiple GPIO users, callback retention, nested interrupt state, self-unregistration, out-of-range dispatch indexes |
+| `block_device_host_tests` | every wrapper and missing callback, exact context/buffer/64-bit LBA/count forwarding, all result categories |
+| `filesystem_host_tests` | invalid inputs preserve state, preparation and rebinding, mount/unmount explicitly unimplemented and never touching storage |
+| `sd_irq_integration_host_tests` | the real SD driver and the real dispatcher together; an unrelated input IRQ survives removal, cleanup, reinsertion and interrupted reads |
+| `board_*`, `debug_*`, `main*` | LED variants, logging enabled and disabled, the real startup and foreground loop including initialisation failures |
+
+## Diagnostics
+
+```sh
+sh tests/tools/run_diagnostics.sh                 # all stages
+sh tests/tools/run_diagnostics.sh strict sanitize # a subset
+```
+
+| Option | Effect |
+| --- | --- |
+| `-DTAVERNKEEP_TEST_SANITIZE=ON` | AddressSanitizer and UndefinedBehaviorSanitizer |
+| `-DTAVERNKEEP_TEST_STRICT_WARNINGS=ON` | `-Werror` on an already strict warning set |
+| `-DTAVERNKEEP_TEST_COVERAGE=ON` | GCC coverage instrumentation |
+| `-DTAVERNKEEP_TEST_KNOWN_GAPS=ON` | enables the regressions for open gaps |
+| `-DTAVERNKEEP_TEST_SEED=N` | fixes the property suite's seed |
+
+Coverage identifies unexercised paths. It does not prove protocol compliance,
+physical timing or concurrency correctness, and `gcov` reports that share a
+basename overwrite each other, so per-target numbers must not be summed.
+Mutation testing is the stronger signal: see [MUTATION.md](MUTATION.md).
+
+## Fake boundaries
+
+- The SD fake is a stateful card model, not a card. It validates command
+  framing and CRC7, tracks application-command state, streams multiple-block
+  reads of any length, and injects faults at named transaction phases. It has
+  no electrical behaviour and no timing variation.
+- Simulated time advances with modelled bus work — an SPI byte costs 8 bit
+  times at the programmed baud rate — not with poll count. Assertions on
+  elapsed time are therefore about the driver's declared budgets. They are not
+  throughput measurements and prove nothing about real-time behaviour.
+- The legacy poll-tick clock is retained and the SD suite runs under both, so a
+  case that depends on the old artifact is exposed rather than hidden.
+- The interrupt fake models one executing core at a time, not simultaneous
+  multicore execution or electrical bounce. Faults land between SPI bytes or at
+  a phase boundary, never between two machine instructions.
+- The integration executable initialises the real dispatcher's static state
+  once per process; do not reset the hardware fake beneath it.
+- Logging is intercepted in a test-only compilation wrapper, and the main
+  wrapper renames the entry point and leaves the real infinite loop with
+  `longjmp` from the fake sleep. Neither replaces production behaviour.
+- Production discards the read and CSD data CRC. Passing tests do not
+  demonstrate CRC validation, working writes, FatFs, PIO/DMA or USB storage.

@@ -40,6 +40,17 @@ static spi_inst_t test_spi = { .id = 0U };
 
 #define CHECK_EQ(expected, actual) CHECK((expected) == (actual))
 
+/* Upper bound on bytes the modelled bus can carry in `elapsed_us`, plus slack
+ * for the surrounding command frames. Under SIM_CLOCK_BUS_TIME this is a tight
+ * bound on how much work a timeout may cost; under SIM_CLOCK_POLL_TICK bytes
+ * are free, so the elapsed-time assertion beside it carries the weight. */
+static uint64_t bus_byte_budget(uint64_t elapsed_us, uint64_t slack)
+{
+    const uint64_t per_byte_ns = sim_clock_spi_byte_ns();
+    return ((elapsed_us * UINT64_C(1000)) / (per_byte_ns == 0U ? 1U : per_byte_ns))
+        + slack;
+}
+
 static sd_spi_config_t valid_config(void)
 {
     const sd_spi_config_t config = {
@@ -490,7 +501,8 @@ static void test_sdhc_initialization(void)
     CHECK(pico_mock_gpio_was_initialized(PIN_CHIP_SELECT));
     CHECK(pico_mock_gpio_was_initialized(PIN_CARD_AVAILABLE));
     CHECK(pico_mock_gpio_was_pulled_up_at_init(PIN_CARD_AVAILABLE));
-    CHECK_EQ(10U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
+    /* Ten stable debounce samples plus the post-registration race check. */
+    CHECK_EQ(11U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
     CHECK_EQ(GPIO_FUNC_SPI, pico_mock_gpio_function(PIN_CLOCK));
     CHECK_EQ(GPIO_FUNC_SPI, pico_mock_gpio_function(PIN_CONTROLLER_OUT));
     CHECK_EQ(GPIO_FUNC_SPI, pico_mock_gpio_function(PIN_CONTROLLER_IN));
@@ -613,7 +625,8 @@ static void test_card_detect_debounce(void)
     CHECK_EQ(BLOCK_DEVICE_RESULT_OK,
         block_device_init(sd_spi_as_block_device(&sd)));
     CHECK(sd.initialized);
-    CHECK_EQ(15U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
+    /* Fifteen debounce samples plus the post-registration race check. */
+    CHECK_EQ(16U, pico_mock_gpio_read_count(PIN_CARD_AVAILABLE));
     CHECK(pico_mock_spi_is_initialized());
 
     pico_mock_reset();
@@ -643,12 +656,23 @@ static void test_card_initialization_timeout_is_bounded(void)
     pico_mock_sd_set_command(55U, 0x01U, NULL, 0U);
     pico_mock_sd_set_command(41U, 0x01U, NULL, 0U);
 
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
         block_device_init(sd_spi_as_block_device(&sd)));
+    const uint64_t elapsed_us = pico_mock_now_us() - start_us;
     CHECK(!sd.initialized);
     CHECK(pico_mock_sd_command_count(41U) > 1U);
-    CHECK(pico_mock_sd_command_count(41U) < 1200U);
-    CHECK(pico_mock_spi_transfer_count() < 16384U);
+    /* The ACMD41 loop owns a 1200 ms budget. It must neither give up early
+     * nor overrun by more than one CMD55+ACMD41 iteration. Asserting elapsed
+     * time rather than a call count means this still measures the timeout if
+     * the loop's polling structure changes. */
+    /* The span measured here also contains the card-detect debounce sleeps
+     * (up to 29 ms) and the 1 ms settle before the idle clocks, so the upper
+     * bound allows for those on top of the loop's own budget. */
+    CHECK(elapsed_us >= UINT64_C(1200000));
+    CHECK(elapsed_us < UINT64_C(1200000) + UINT64_C(40000));
+    CHECK_EQ(pico_mock_sd_command_count(55U), pico_mock_sd_command_count(41U));
+    CHECK(pico_mock_spi_transfer_count() <= bus_byte_budget(elapsed_us, 64U));
 }
 
 static void test_deinit_waits_and_releases_resources(void)
@@ -678,8 +702,10 @@ static void test_deinit_timeout_preserves_resources(void)
     sd_spi_t sd = { 0 };
     block_device_t *const device = initialize_sdhc(&sd);
 
-    pico_mock_sd_set_busy_cycles(2000U);
+    pico_mock_sd_set_busy_forever();
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_BUSY_TIMEOUT, block_device_deinit(device));
+    CHECK(pico_mock_now_us() - start_us >= UINT64_C(1000000));
     CHECK(sd.initialized);
     CHECK(pico_mock_spi_is_initialized());
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
@@ -845,11 +871,20 @@ static void test_cmd9_response_and_data_token_failures(void)
     CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
     configure_successful_sdhc_card();
     pico_mock_sd_set_command(9U, 0x00U, NULL, 0U);
-    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
-        block_device_init(sd_spi_as_block_device(&sd)));
-    CHECK_EQ(0U, sd.block_count);
-    CHECK_EQ(1U, pico_mock_sd_command_count(9U));
-    CHECK(pico_mock_spi_transfer_count() < 512U);
+    CHECK(pico_mock_sd_set_stall_after_r1(9U, true));
+    {
+        const uint64_t start_us = pico_mock_now_us();
+        CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
+            block_device_init(sd_spi_as_block_device(&sd)));
+        const uint64_t elapsed_us = pico_mock_now_us() - start_us;
+        CHECK_EQ(0U, sd.block_count);
+        CHECK_EQ(1U, pico_mock_sd_command_count(9U));
+        /* CMD9's data-token wait owns a 100 ms budget and must not retry. */
+        CHECK(elapsed_us >= UINT64_C(100000));
+        CHECK(elapsed_us < UINT64_C(100000) + UINT64_C(40000));
+        CHECK(pico_mock_spi_transfer_count()
+            <= bus_byte_budget(elapsed_us, 128U));
+    }
 
     pico_mock_reset();
     memset(&sd, 0, sizeof(sd));
@@ -955,10 +990,19 @@ static void test_single_block_read_failures(void)
     device = initialize_sdhc(&sd);
     CHECK(device != NULL);
     pico_mock_sd_set_command(17U, 0x00U, NULL, 0U);
+    CHECK(pico_mock_sd_set_stall_after_r1(17U, true));
     const size_t transfers_before = pico_mock_spi_transfer_count();
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
         block_device_read_blocks(device, 0U, block, 1U));
-    CHECK(pico_mock_spi_transfer_count() - transfers_before < 256U);
+    const uint64_t elapsed_us = pico_mock_now_us() - start_us;
+    /* A card that answers R1 and then never produces a data token must cost
+     * exactly one 100 ms wait and one CMD17, not a retry loop. */
+    CHECK(elapsed_us >= UINT64_C(100000));
+    CHECK(elapsed_us < UINT64_C(110000));
+    CHECK_EQ(1U, pico_mock_sd_command_count(17U));
+    CHECK(pico_mock_spi_transfer_count() - transfers_before
+        <= bus_byte_budget(elapsed_us, 128U));
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
 }
 
@@ -1240,10 +1284,13 @@ static void test_initialization_reports_busy_timeout(void)
     sd_spi_t sd = { 0 };
     const sd_spi_config_t config = valid_config();
     CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
-    pico_mock_sd_set_busy_cycles(2000U);
+    pico_mock_sd_set_busy_forever();
 
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_BUSY_TIMEOUT,
         block_device_init(sd_spi_as_block_device(&sd)));
+    /* The ready wait ahead of CMD0 owns a 1000 ms budget. */
+    CHECK(pico_mock_now_us() - start_us >= UINT64_C(1000000));
     CHECK(!sd.initialized);
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
 }
@@ -1256,10 +1303,13 @@ static void test_read_command_reports_busy_timeout(void)
     sd_spi_t sd = { 0 };
     block_device_t *const device = initialize_sdhc(&sd);
     CHECK(device != NULL);
-    pico_mock_sd_set_busy_cycles(2000U);
+    pico_mock_sd_set_busy_forever();
 
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_BUSY_TIMEOUT,
         block_device_read_blocks(device, 0U, block, 1U));
+    CHECK(pico_mock_now_us() - start_us >= UINT64_C(1000000));
+    /* A busy card must block the command, not have it sent anyway. */
     CHECK_EQ(0U, pico_mock_sd_command_count(17U));
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
 }
@@ -1269,20 +1319,21 @@ static void test_stop_transmission_reports_busy_timeout(void)
     enum { PAYLOAD_SIZE = 2 * (SD_BLOCK_SIZE + 3) };
     uint8_t payload[PAYLOAD_SIZE];
     uint8_t blocks[2U * SD_BLOCK_SIZE];
-    static uint8_t busy_response[1200];
 
     pico_mock_reset();
     sd_spi_t sd = { 0 };
     block_device_t *const device = initialize_sdhc(&sd);
     CHECK(device != NULL);
     (void)make_read_payload(payload, 2U, 0x81U);
-    memset(busy_response, 0, sizeof(busy_response));
     pico_mock_sd_set_command(18U, 0x00U, payload, sizeof(payload));
-    pico_mock_sd_set_command(12U, 0x00U,
-        busy_response, sizeof(busy_response));
+    pico_mock_sd_set_command(12U, 0x00U, NULL, 0U);
+    /* CMD12 answers R1 and then holds the line busy: R1b, never released. */
+    CHECK(pico_mock_sd_set_busy_after_payload(12U, true));
 
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_BUSY_TIMEOUT,
         block_device_read_blocks(device, 0U, blocks, 2U));
+    CHECK(pico_mock_now_us() - start_us >= UINT64_C(1000000));
     CHECK_EQ(1U, pico_mock_sd_command_count(12U));
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
 }
@@ -1291,22 +1342,526 @@ static void test_error_cleanup_reports_busy_timeout(void)
 {
     uint8_t blocks[2U * SD_BLOCK_SIZE];
     static const uint8_t error_token[] = { 0x08U };
-    static uint8_t busy_response[1200];
 
     pico_mock_reset();
     sd_spi_t sd = { 0 };
     block_device_t *const device = initialize_sdhc(&sd);
     CHECK(device != NULL);
-    memset(busy_response, 0, sizeof(busy_response));
     CHECK(pico_mock_sd_set_command(18U, 0x00U,
         error_token, sizeof(error_token)));
-    CHECK(pico_mock_sd_set_command(12U, 0x00U,
-        busy_response, sizeof(busy_response)));
+    CHECK(pico_mock_sd_set_command(12U, 0x00U, NULL, 0U));
+    CHECK(pico_mock_sd_set_busy_after_payload(12U, true));
 
+    const uint64_t start_us = pico_mock_now_us();
     CHECK_EQ(BLOCK_DEVICE_RESULT_BUSY_TIMEOUT,
         block_device_read_blocks(device, 0U, blocks, 2U));
+    CHECK(pico_mock_now_us() - start_us >= UINT64_C(1000000));
     CHECK_EQ(1U, pico_mock_sd_command_count(12U));
     CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+}
+
+static void test_card_detect_irq_registration_and_latch(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+
+    CHECK(pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK(pico_mock_gpio_irq_is_enabled(PIN_CARD_AVAILABLE));
+    CHECK_EQ(GPIO_IRQ_EDGE_RISE,
+        pico_mock_gpio_irq_events(PIN_CARD_AVAILABLE));
+    CHECK_EQ(1U,
+        pico_mock_gpio_irq_registration_count(PIN_CARD_AVAILABLE));
+    CHECK(!atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+
+    CHECK(!pico_mock_gpio_irq_fire(
+        PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_FALL));
+    CHECK(!atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+
+    CHECK(pico_mock_gpio_irq_fire(
+        PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+    CHECK(!pico_mock_gpio_irq_is_enabled(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_gpio_irq_fire(
+        PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE));
+}
+
+static void test_card_detect_irq_registration_failure(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    const sd_spi_config_t config = valid_config();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    configure_successful_sdhc_card();
+    pico_mock_gpio_irq_reject_next_registration();
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK(pico_mock_gpio_was_deinitialized(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_spi_is_initialized());
+}
+
+static void test_card_detect_post_registration_race(void)
+{
+    static const bool card_detect_sequence[] = {
+        false, false, false, false, false,
+        false, false, false, false, false,
+        true,
+    };
+
+    pico_mock_reset();
+    CHECK(pico_mock_gpio_set_input_sequence(
+        PIN_CARD_AVAILABLE,
+        card_detect_sequence,
+        sizeof(card_detect_sequence) / sizeof(card_detect_sequence[0])));
+
+    sd_spi_t sd = { 0 };
+    const sd_spi_config_t config = valid_config();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK_EQ(1U,
+        pico_mock_gpio_irq_unregistration_count(PIN_CARD_AVAILABLE));
+    CHECK(pico_mock_gpio_was_deinitialized(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_spi_is_initialized());
+}
+
+static void test_card_detect_post_registration_bounce_is_latched(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    const sd_spi_config_t config = valid_config();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    pico_mock_gpio_irq_fire_on_next_registration(GPIO_IRQ_EDGE_RISE);
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK_EQ(1U,
+        pico_mock_gpio_irq_unregistration_count(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_gpio_level(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_spi_is_initialized());
+}
+
+static void test_initialization_rollback_unregisters_card_irq(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    const sd_spi_config_t config = valid_config();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    CHECK(pico_mock_sd_set_command(0U, 0x02U, NULL, 0U));
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK_EQ(1U,
+        pico_mock_gpio_irq_unregistration_count(PIN_CARD_AVAILABLE));
+}
+
+static void test_deinit_unregisters_card_irq(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    CHECK(pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_deinit(device));
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK_EQ(1U,
+        pico_mock_gpio_irq_unregistration_count(PIN_CARD_AVAILABLE));
+}
+
+static void test_latched_removal_rejects_new_operations(void)
+{
+    uint8_t block[SD_BLOCK_SIZE];
+    block_device_info_t info;
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    CHECK(pico_mock_gpio_irq_fire(
+        PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE));
+
+    const size_t transfers_before = pico_mock_spi_transfer_count();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_read_blocks(device, 0U, block, 1U));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_write_blocks(device, 0U, block, 1U));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_get_info(device, &info));
+    CHECK_EQ(transfers_before, pico_mock_spi_transfer_count());
+    CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+}
+
+static void test_removal_interrupts_single_block_read(void)
+{
+    uint8_t payload[1U + SD_BLOCK_SIZE + 2U];
+    uint8_t block[SD_BLOCK_SIZE];
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    const size_t payload_size = make_read_payload(payload, 1U, 0x2aU);
+    CHECK(pico_mock_sd_set_command(
+        17U, 0x00U, payload, payload_size));
+
+    const size_t transfers_before = pico_mock_spi_transfer_count();
+    pico_mock_gpio_irq_fire_after_spi_transfers(
+        10U, PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE);
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_read_blocks(device, 0U, block, 1U));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+    CHECK(pico_mock_spi_transfer_count() - transfers_before < 64U);
+    CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+    CHECK_EQ(0U, pico_mock_sd_command_count(12U));
+}
+
+static void test_removal_interrupts_multiple_block_read_without_cmd12(void)
+{
+    uint8_t payload[2U * (1U + SD_BLOCK_SIZE + 2U)];
+    uint8_t blocks[2U * SD_BLOCK_SIZE];
+
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    const size_t payload_size = make_read_payload(payload, 2U, 0x51U);
+    CHECK(pico_mock_sd_set_command(
+        18U, 0x00U, payload, payload_size));
+    CHECK(pico_mock_sd_set_command(12U, 0x00U, NULL, 0U));
+
+    const size_t transfers_before = pico_mock_spi_transfer_count();
+    pico_mock_gpio_irq_fire_after_spi_transfers(
+        10U, PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE);
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_read_blocks(device, 0U, blocks, 2U));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+    CHECK(pico_mock_spi_transfer_count() - transfers_before < 64U);
+    CHECK_EQ(1U, pico_mock_sd_command_count(18U));
+    CHECK_EQ(0U, pico_mock_sd_command_count(12U));
+    CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+}
+
+static void test_removal_during_initialization_rolls_back(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    const sd_spi_config_t config = valid_config();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    configure_successful_sdhc_card();
+    pico_mock_gpio_irq_fire_after_spi_transfers(
+        1U, PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE);
+
+    CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+        block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK(!pico_mock_spi_is_initialized());
+    CHECK(pico_mock_gpio_was_deinitialized(PIN_CARD_AVAILABLE));
+}
+
+static void test_removal_cleanup_allows_fresh_initialization(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = { 0 };
+    block_device_t *const device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    CHECK(pico_mock_gpio_irq_fire(
+        PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE));
+
+    const size_t transfers_before = pico_mock_spi_transfer_count();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_deinit(device));
+    CHECK_EQ(transfers_before, pico_mock_spi_transfer_count());
+    CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK(atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+
+    configure_successful_sdhc_card();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_init(device));
+    CHECK(pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+    CHECK(pico_mock_gpio_irq_is_enabled(PIN_CARD_AVAILABLE));
+    CHECK(!atomic_load_explicit(
+        &sd.removal_latched, memory_order_relaxed));
+}
+
+static void test_modern_sdsc_and_retry_success(void)
+{
+    pico_mock_reset();
+    pico_mock_sd_use_chip_select(PIN_CHIP_SELECT);
+    sd_spi_t sd = {0};
+    sd_spi_config_t config = valid_config();
+    config.baud_rate_hz = 25000000U;
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    configure_successful_sdsc_card();
+    const uint8_t r7[] = {0, 0, 1, 0xaa};
+    CHECK(pico_mock_sd_set_command(8, 1, r7, sizeof(r7)));
+    CHECK(pico_mock_sd_set_idle_responses(41, 3));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_init(sd_spi_as_block_device(&sd)));
+    CHECK(!sd.card_type_legacy && !sd.card_type_hcxc);
+    CHECK_EQ(4U, pico_mock_sd_command_count(41));
+    CHECK_EQ(4U, pico_mock_sd_command_count(55));
+    CHECK_EQ(0x40000000U, pico_mock_sd_last_argument(41));
+    CHECK_EQ(512U, pico_mock_sd_last_argument(16));
+    CHECK_EQ(25000000U, pico_mock_spi_baudrate());
+
+    uint8_t payload[2 * (SD_BLOCK_SIZE + 3)];
+    uint8_t blocks[2 * SD_BLOCK_SIZE + 2];
+    memset(blocks, 0x5a, sizeof(blocks));
+    make_read_payload(payload, 2, 0x97);
+    CHECK(pico_mock_sd_set_command(18, 0, payload, sizeof(payload)));
+    CHECK(pico_mock_sd_set_command(12, 0, NULL, 0));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK,
+        block_device_read_blocks(sd_spi_as_block_device(&sd), 0x12345, blocks + 1, 2));
+    CHECK_EQ(0x02468a00U, pico_mock_sd_last_argument(18));
+    CHECK(buffer_matches(blocks + 1, 2, 0x97));
+    CHECK_EQ(0x5a, blocks[0]);
+    CHECK_EQ(0x5a, blocks[sizeof(blocks) - 1]);
+}
+
+static void test_initialization_error_matrix(void)
+{
+    for (unsigned int scenario = 0; scenario < 8; ++scenario) {
+        pico_mock_reset();
+        pico_mock_sd_use_chip_select(PIN_CHIP_SELECT);
+        sd_spi_t sd = {0};
+        sd_spi_config_t config = valid_config();
+        CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+        configure_successful_sdhc_card();
+        const uint8_t wrong_echo[] = {0, 0, 1, 0xab};
+        switch (scenario) {
+        case 0: CHECK(pico_mock_sd_set_command(8, 1, wrong_echo, sizeof(wrong_echo))); break;
+        case 1: CHECK(pico_mock_sd_set_command(8, 0x09, NULL, 0)); break;
+        case 2: CHECK(pico_mock_sd_set_command(55, 0x04, NULL, 0)); break;
+        case 3: CHECK(pico_mock_sd_set_command(41, 0x04, NULL, 0)); break;
+        case 4: CHECK(pico_mock_sd_set_command(58, 0x04, NULL, 0)); break;
+        case 5: configure_successful_sdsc_card(); CHECK(pico_mock_sd_set_response_delay(16, 8)); break;
+        case 6: configure_csd_v1(); break; /* CCS and CSD disagree. */
+        case 7: configure_successful_sdsc_card(); configure_csd_v2(); break;
+        }
+        CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, block_device_init(sd_spi_as_block_device(&sd)));
+        CHECK(!sd.initialized && sd.block_count == 0);
+        CHECK(!sd.card_type_legacy && !sd.card_type_hcxc);
+        CHECK(!pico_mock_spi_is_initialized());
+        CHECK_EQ(1U, pico_mock_spi_deinit_count());
+        CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+        CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+        CHECK_EQ(400000U, pico_mock_spi_baudrate());
+    }
+    /* CSD v1 permits READ_BL_LEN 9..11; reject every other encoding. */
+    for (uint8_t length = 0; length < 16; ++length) {
+        if (length >= 9 && length <= 11) { continue; }
+        pico_mock_reset();
+        sd_spi_t sd = {0};
+        sd_spi_config_t config = valid_config();
+        CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+        configure_successful_sdsc_card();
+        configure_csd_v1_fields(1023, 7, length);
+        CHECK_EQ(BLOCK_DEVICE_RESULT_IO_ERROR, block_device_init(sd_spi_as_block_device(&sd)));
+        CHECK(!sd.initialized && sd.block_count == 0);
+        CHECK_EQ(0U, pico_mock_sd_command_count(16));
+    }
+}
+
+static void test_spi_framing_and_response_boundary(void)
+{
+    /* Seven wait bytes put R1 in byte eight; eight wait bytes must time out. */
+    for (size_t delay = 7; delay <= 8; ++delay) {
+        pico_mock_reset();
+        pico_mock_sd_use_chip_select(PIN_CHIP_SELECT);
+        sd_spi_t sd = {0};
+        block_device_t *device = initialize_sdhc(&sd);
+        CHECK(device != NULL);
+        const uint8_t *tx = pico_mock_spi_tx_log();
+        for (size_t i = 0; i < 10; ++i) {
+            CHECK_EQ(0xffU, tx[i]);
+            CHECK(pico_mock_spi_tx_chip_select_high(i));
+        }
+        const uint8_t cmd0[] = {0x40, 0, 0, 0, 0, 0x95};
+        const uint8_t cmd8[] = {0x48, 0, 0, 1, 0xaa, 0x87};
+        CHECK(memcmp(tx + 11, cmd0, sizeof(cmd0)) == 0);
+        CHECK(memcmp(tx + 19, cmd8, sizeof(cmd8)) == 0);
+        size_t before = pico_mock_spi_transfer_count();
+        for (size_t i = 10; i + 1 < before; ++i) {
+            CHECK(!pico_mock_spi_tx_chip_select_high(i));
+        }
+        CHECK(pico_mock_spi_tx_chip_select_high(before - 1));
+        uint8_t payload[SD_BLOCK_SIZE + 3], block[SD_BLOCK_SIZE];
+        make_read_payload(payload, 1, 0x49);
+        CHECK(pico_mock_sd_set_command(17, 0, payload, sizeof(payload)));
+        CHECK(pico_mock_sd_set_response_delay(17, delay));
+        CHECK_EQ(delay == 7 ? BLOCK_DEVICE_RESULT_OK : BLOCK_DEVICE_RESULT_IO_ERROR,
+            block_device_read_blocks(device, 0, block, 1));
+        if (delay == 7) { CHECK(buffer_matches(block, 1, 0x49)); }
+        else { CHECK(pico_mock_spi_transfer_count() - before <= 16U); }
+        CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+        CHECK_EQ(0U, pico_mock_sd_pending_response_count());
+    }
+}
+
+static void test_all_data_error_token_combinations(void)
+{
+    for (uint8_t token = 1; token <= 15; ++token) {
+        verify_data_error_token(token);
+    }
+}
+
+static void test_maximum_sdhc_lba_and_overflow_requests(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = {0};
+    sd_spi_config_t config = valid_config();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+    configure_successful_sdhc_card();
+    configure_csd_v2_fields(0x3fffff);
+    block_device_t *device = sd_spi_as_block_device(&sd);
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_init(device));
+    CHECK_EQ(UINT64_C(0x100000000), sd.block_count);
+    uint8_t payload[SD_BLOCK_SIZE + 3], block[SD_BLOCK_SIZE];
+    make_read_payload(payload, 1, 0x71);
+    CHECK(pico_mock_sd_set_command(17, 0, payload, sizeof(payload)));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_read_blocks(device, UINT32_MAX, block, 1));
+    CHECK_EQ(UINT32_MAX, pico_mock_sd_last_argument(17));
+    CHECK(buffer_matches(block, 1, 0x71));
+    size_t before = pico_mock_spi_transfer_count();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OUT_OF_RANGE, block_device_read_blocks(device, UINT64_MAX, block, 2));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OUT_OF_RANGE, block_device_read_blocks(device, UINT32_MAX, block, 2));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OUT_OF_RANGE, block_device_read_blocks(device, 1, block, SIZE_MAX));
+    CHECK_EQ(before, pico_mock_spi_transfer_count());
+}
+
+static void test_initialization_removal_at_each_byte(void)
+{
+    pico_mock_reset();
+    sd_spi_t baseline = {0};
+    CHECK(initialize_sdhc(&baseline) != NULL);
+    size_t total = pico_mock_spi_transfer_count();
+    for (size_t offset = 1; offset <= total; ++offset) {
+        pico_mock_reset();
+        pico_mock_sd_use_chip_select(PIN_CHIP_SELECT);
+        sd_spi_t sd = {0};
+        sd_spi_config_t config = valid_config();
+        CHECK_EQ(BLOCK_DEVICE_RESULT_OK, sd_spi_configure(&sd, &config));
+        configure_successful_sdhc_card();
+        pico_mock_gpio_irq_fire_after_spi_transfers(offset, PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE);
+        block_device_result_t result = block_device_init(sd_spi_as_block_device(&sd));
+        if (result != BLOCK_DEVICE_RESULT_INVALID_DEVICE) {
+            fprintf(stderr, "initialization removal offset=%zu result=%d\n", offset, result);
+        }
+        CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE, result);
+        CHECK(!sd.initialized && sd.block_count == 0);
+        CHECK(atomic_load(&sd.removal_latched));
+        CHECK(!pico_mock_gpio_irq_is_registered(PIN_CARD_AVAILABLE));
+        CHECK(!pico_mock_spi_is_initialized());
+        CHECK_EQ(1U, pico_mock_spi_deinit_count());
+        CHECK(pico_mock_spi_transfer_count() <= offset + 5U);
+    }
+}
+
+static void verify_read_removal_at_each_byte(size_t count, bool release_only)
+{
+    uint8_t payload[2 * (SD_BLOCK_SIZE + 3)];
+    uint8_t guarded[2 * SD_BLOCK_SIZE + 2];
+    const size_t payload_size = make_read_payload(payload, count, 0x37);
+    pico_mock_reset();
+    sd_spi_t baseline = {0};
+    block_device_t *device = initialize_sdhc(&baseline);
+    CHECK(device != NULL);
+    CHECK(pico_mock_sd_set_command(count == 1 ? 17 : 18, 0, payload, payload_size));
+    CHECK(pico_mock_sd_set_command(12, 0, NULL, 0));
+    size_t start = pico_mock_spi_transfer_count();
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_read_blocks(device, 0, guarded + 1, count));
+    const size_t total = pico_mock_spi_transfer_count() - start;
+    /* The final release byte is a separately registered known-gap regression. */
+    for (size_t offset = release_only ? total : 1; offset <= (release_only ? total : total - 1); ++offset) {
+        pico_mock_reset();
+        pico_mock_sd_use_chip_select(PIN_CHIP_SELECT);
+        sd_spi_t sd = {0};
+        device = initialize_sdhc(&sd);
+        CHECK(device != NULL);
+        CHECK(pico_mock_sd_set_command(count == 1 ? 17 : 18, 0, payload, payload_size));
+        CHECK(pico_mock_sd_set_command(12, 0, NULL, 0));
+        memset(guarded, 0xa5, sizeof(guarded));
+        start = pico_mock_spi_transfer_count();
+        pico_mock_gpio_irq_fire_after_spi_transfers(offset, PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE);
+        block_device_result_t result = block_device_read_blocks(device, 0, guarded + 1, count);
+        if (result != BLOCK_DEVICE_RESULT_INVALID_DEVICE) {
+            fprintf(stderr, "read removal blocks=%zu offset=%zu/%zu result=%d latch=%d\n",
+                count, offset, total, result, (int)atomic_load(&sd.removal_latched));
+        }
+        CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE, result);
+        CHECK(atomic_load(&sd.removal_latched));
+        CHECK_EQ(0xa5, guarded[0]);
+        CHECK_EQ(0xa5, guarded[count * SD_BLOCK_SIZE + 1]);
+        CHECK(pico_mock_gpio_level(PIN_CHIP_SELECT));
+        CHECK(pico_mock_spi_is_initialized()); /* ISR does not tear down. */
+        CHECK_EQ(0U, pico_mock_spi_deinit_count());
+        CHECK(!pico_mock_gpio_irq_is_enabled(PIN_CARD_AVAILABLE));
+        CHECK(pico_mock_spi_transfer_count() - start <= offset + 5U);
+        if (offset <= 8U + payload_size) { CHECK_EQ(0U, pico_mock_sd_command_count(12)); }
+        start = pico_mock_spi_transfer_count();
+        CHECK_EQ(BLOCK_DEVICE_RESULT_INVALID_DEVICE, block_device_read_blocks(device, 0, guarded + 1, count));
+        CHECK_EQ(start, pico_mock_spi_transfer_count());
+        CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_deinit(device));
+        CHECK_EQ(start, pico_mock_spi_transfer_count());
+        CHECK_EQ(1U, pico_mock_spi_deinit_count());
+    }
+}
+static void test_single_read_removal_boundaries(void) { verify_read_removal_at_each_byte(1, false); }
+static void test_multi_read_removal_boundaries(void) { verify_read_removal_at_each_byte(2, false); }
+static void test_single_read_release_removal(void) { verify_read_removal_at_each_byte(1, true); }
+static void test_multi_read_release_removal(void) { verify_read_removal_at_each_byte(2, true); }
+
+static void test_removal_during_busy_waits(void)
+{
+    for (unsigned int deinit = 0; deinit < 2; ++deinit) {
+        pico_mock_reset();
+        sd_spi_t sd = {0};
+        block_device_t *device = initialize_sdhc(&sd);
+        CHECK(device != NULL);
+        pico_mock_sd_set_busy_cycles(2000);
+        pico_mock_gpio_irq_fire_after_spi_transfers(3, PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE);
+        uint64_t before_time = pico_mock_now_ms();
+        size_t before = pico_mock_spi_transfer_count();
+        uint8_t block[SD_BLOCK_SIZE];
+        CHECK_EQ(deinit ? BLOCK_DEVICE_RESULT_OK : BLOCK_DEVICE_RESULT_INVALID_DEVICE,
+            deinit ? block_device_deinit(device) : block_device_read_blocks(device, 0, block, 1));
+        CHECK_EQ(3U, pico_mock_spi_transfer_count() - before);
+        CHECK(pico_mock_now_ms() - before_time < 10U);
+        CHECK_EQ(0U, pico_mock_sd_command_count(17));
+        CHECK_EQ(deinit ? 1U : 0U, pico_mock_spi_deinit_count());
+    }
+}
+
+static void test_repeated_removal_teardown(void)
+{
+    pico_mock_reset();
+    sd_spi_t sd = {0};
+    block_device_t *device = initialize_sdhc(&sd);
+    CHECK(device != NULL);
+    CHECK(pico_mock_gpio_irq_fire(PIN_CARD_AVAILABLE, GPIO_IRQ_EDGE_RISE));
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_deinit(device));
+    CHECK_EQ(1U, pico_mock_spi_deinit_count());
+    CHECK_EQ(BLOCK_DEVICE_RESULT_OK, block_device_deinit(device));
+    CHECK_EQ(1U, pico_mock_spi_deinit_count());
 }
 
 static void run_test(void (*test)(void), const char *name)
@@ -1321,8 +1876,53 @@ static void run_test(void (*test)(void), const char *name)
     }
 }
 
-int main(void)
+/* The whole suite can be run under either clock model. Anything that only
+ * passes with SIM_CLOCK_POLL_TICK is relying on the legacy artifact where
+ * fake time advanced once per time_reached() call rather than with bus work;
+ * CTest runs both so such a case cannot hide. */
+static bool select_clock_mode(const char *argument)
 {
+    if (strcmp(argument, "--clock=bus-time") == 0) {
+        pico_mock_set_clock_mode(SIM_CLOCK_BUS_TIME);
+        return true;
+    }
+    if (strcmp(argument, "--clock=poll-tick") == 0) {
+        pico_mock_set_clock_mode(SIM_CLOCK_POLL_TICK);
+        return true;
+    }
+    return false;
+}
+
+int main(int argc, char **argv)
+{
+    int positional = argc;
+    if (argc >= 2 && select_clock_mode(argv[argc - 1])) {
+        positional = argc - 1;
+    }
+    argc = positional;
+    if (argc == 2) {
+        if (strcmp(argv[1], "--gap-single-release") == 0) {
+            run_test(test_single_read_release_removal, "removal on CMD17 release must cancel success");
+        } else if (strcmp(argv[1], "--gap-multi-release") == 0) {
+            run_test(test_multi_read_release_removal, "removal on CMD18 release must cancel success");
+        } else if (strcmp(argv[1], "--gap-repeated-teardown") == 0) {
+            run_test(test_repeated_removal_teardown, "removal teardown releases hardware exactly once");
+        } else {
+            fprintf(stderr, "Unknown test selector: %s\n", argv[1]);
+            return 2;
+        }
+        return failures != 0;
+    }
+    if (argc != 1) { return 2; }
+    run_test(test_modern_sdsc_and_retry_success, "modern SDSC, ACMD41 retries and multiblock byte addressing");
+    run_test(test_initialization_error_matrix, "initialization rejection matrix and invalid CSD encodings");
+    run_test(test_spi_framing_and_response_boundary, "SPI selection, command CRC and R1 byte boundary");
+    run_test(test_all_data_error_token_combinations, "all fifteen data-error token combinations");
+    run_test(test_maximum_sdhc_lba_and_overflow_requests, "maximum SDHC address and overflow rejection");
+    run_test(test_initialization_removal_at_each_byte, "initialization removal at each SPI byte");
+    run_test(test_single_read_removal_boundaries, "single read removal at each active SPI byte");
+    run_test(test_multi_read_removal_boundaries, "multi read removal at each active SPI byte");
+    run_test(test_removal_during_busy_waits, "read and deinit busy waits cancel promptly");
     run_test(test_block_device_wrapper_validation,
         "block device wrapper validation");
     run_test(test_backend_context_validation,
@@ -1397,6 +1997,28 @@ int main(void)
         "stop transmission busy timeout");
     run_test(test_error_cleanup_reports_busy_timeout,
         "error cleanup busy timeout");
+    run_test(test_card_detect_irq_registration_and_latch,
+        "card-detect IRQ registration and latch");
+    run_test(test_card_detect_irq_registration_failure,
+        "card-detect IRQ registration failure");
+    run_test(test_card_detect_post_registration_race,
+        "card-detect post-registration race");
+    run_test(test_card_detect_post_registration_bounce_is_latched,
+        "card-detect post-registration bounce latch");
+    run_test(test_initialization_rollback_unregisters_card_irq,
+        "initialization rollback unregisters card IRQ");
+    run_test(test_deinit_unregisters_card_irq,
+        "deinit unregisters card IRQ");
+    run_test(test_latched_removal_rejects_new_operations,
+        "latched removal rejects new operations");
+    run_test(test_removal_interrupts_single_block_read,
+        "removal interrupts single-block read");
+    run_test(test_removal_interrupts_multiple_block_read_without_cmd12,
+        "removal interrupts multi-block read without CMD12");
+    run_test(test_removal_during_initialization_rolls_back,
+        "removal during initialization rolls back");
+    run_test(test_removal_cleanup_allows_fresh_initialization,
+        "removal cleanup allows fresh initialization");
 
     if (failures != 0) {
         (void)fprintf(stderr, "%d of %d tests failed\n", failures, tests_run);

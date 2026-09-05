@@ -1,33 +1,27 @@
 #include "pico_mock.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "pico/time.h"
+#include "platform/gpio_irq.h"
+#include "sd_card_model.h"
+#include "sim_clock.h"
 
 enum {
     MOCK_PIN_COUNT = 64,
-    MOCK_GPIO_INPUT_SEQUENCE_CAPACITY = 64,
-    MOCK_COMMAND_COUNT = 64,
-    MOCK_RESPONSE_CAPACITY = 8192,
-    MOCK_TX_CAPACITY = 16384,
+    MOCK_GPIO_INPUT_SEQUENCE_CAPACITY = 256,
 };
-
-typedef struct {
-    bool configured;
-    uint8_t r1;
-    uint8_t payload[PICO_MOCK_MAX_COMMAND_PAYLOAD];
-    size_t payload_size;
-    size_t count;
-    uint32_t last_argument;
-} mock_command_t;
 
 static bool gpio_levels[MOCK_PIN_COUNT];
 static bool gpio_pull_ups[MOCK_PIN_COUNT];
 static bool gpio_pulled_up_at_init[MOCK_PIN_COUNT];
 static bool gpio_initialized[MOCK_PIN_COUNT];
 static bool gpio_deinitialized[MOCK_PIN_COUNT];
+static size_t gpio_deinit_counts[MOCK_PIN_COUNT];
 static bool gpio_directions[MOCK_PIN_COUNT];
 static unsigned int gpio_functions[MOCK_PIN_COUNT];
 static size_t gpio_read_counts[MOCK_PIN_COUNT];
@@ -35,115 +29,61 @@ static bool gpio_input_sequence[MOCK_GPIO_INPUT_SEQUENCE_CAPACITY];
 static size_t gpio_input_sequence_size;
 static size_t gpio_input_sequence_position;
 static unsigned int gpio_input_sequence_pin;
+static bool gpio_input_sequence_exhausted;
 
 static bool spi_initialized;
 static unsigned int spi_initial_baudrate;
 static unsigned int spi_baudrate;
-static uint8_t spi_tx_log[MOCK_TX_CAPACITY];
+static size_t spi_init_count;
+static size_t spi_deinit_count;
+static uint8_t spi_tx_log[PICO_MOCK_TX_WINDOW];
+static bool spi_tx_cs_high[PICO_MOCK_TX_WINDOW];
+static size_t spi_tx_logged;
 static size_t spi_tx_count;
 
-static mock_command_t commands[MOCK_COMMAND_COUNT];
-static uint8_t command_bytes[6];
-static size_t command_byte_count;
-static size_t busy_cycles;
-static uint8_t response_bytes[MOCK_RESPONSE_CAPACITY];
-static size_t response_head;
-static size_t response_tail;
-static absolute_time_t mock_now;
+static unsigned int chip_select_pin;
+static unsigned int card_detect_pin;
+
+static bool scheduled_gpio_irq;
+static size_t scheduled_gpio_irq_transfer;
+static unsigned int scheduled_gpio_irq_pin;
+static uint32_t scheduled_gpio_irq_events;
 
 static bool valid_pin(unsigned int pin)
 {
     return pin < MOCK_PIN_COUNT;
 }
 
-static void enqueue_response(uint8_t value)
+static void sync_chip_select(void)
 {
-    if (response_tail < MOCK_RESPONSE_CAPACITY) {
-        response_bytes[response_tail++] = value;
+    if (!valid_pin(chip_select_pin)) {
+        /* No chip select registered: the historical fixtures ran with the
+         * card permanently selected. Keep that so they keep meaning what
+         * they meant, rather than silently changing their subject. */
+        sd_card_set_chip_select(false);
+        return;
     }
-}
-
-static uint8_t complete_command(void)
-{
-    const uint8_t command = command_bytes[0] & 0x3fU;
-    command_byte_count = 0U;
-
-    /* CMD12 aborts any unread data from an active multiple-block stream. */
-    if (command == 12U) {
-        response_head = 0U;
-        response_tail = 0U;
-    }
-
-    if (command >= MOCK_COMMAND_COUNT) {
-        return 0xffU;
-    }
-
-    mock_command_t *const behavior = &commands[command];
-    behavior->count++;
-    behavior->last_argument =
-        ((uint32_t)command_bytes[1] << 24U)
-        | ((uint32_t)command_bytes[2] << 16U)
-        | ((uint32_t)command_bytes[3] << 8U)
-        | (uint32_t)command_bytes[4];
-
-    if (!behavior->configured) {
-        enqueue_response(0xffU);
-        return 0xffU;
-    }
-
-    if (command == 12U) {
-        /* CMD12 has one positional stuff byte before its R1 response. */
-        enqueue_response(0x00U);
-    }
-    enqueue_response(behavior->r1);
-    for (size_t i = 0U; i < behavior->payload_size; ++i) {
-        enqueue_response(behavior->payload[i]);
-    }
-    return 0xffU;
-}
-
-static uint8_t transfer_byte(uint8_t tx)
-{
-    if (spi_tx_count < MOCK_TX_CAPACITY) {
-        spi_tx_log[spi_tx_count++] = tx;
-    }
-
-    if (command_byte_count != 0U) {
-        command_bytes[command_byte_count++] = tx;
-        if (command_byte_count == sizeof(command_bytes)) {
-            return complete_command();
-        }
-        return 0xffU;
-    }
-
-    if ((tx & 0xc0U) == 0x40U) {
-        command_bytes[0] = tx;
-        command_byte_count = 1U;
-        return 0xffU;
-    }
-
-    if (response_head < response_tail) {
-        return response_bytes[response_head++];
-    }
-
-    response_head = 0U;
-    response_tail = 0U;
-
-    if (tx == 0xffU && busy_cycles != 0U) {
-        busy_cycles--;
-        return 0x00U;
-    }
-
-    return 0xffU;
+    sd_card_set_chip_select(gpio_levels[chip_select_pin]);
 }
 
 void pico_mock_reset(void)
 {
+    pico_mock_gpio_irq_reset();
+    (void)platform_gpio_irq_init();
+    /* The clock model is a property of the run, not of a single fixture, so
+     * it survives a reset. Otherwise a suite launched in poll-tick mode would
+     * silently fall back to bus time at the first pico_mock_reset(). */
+    const sim_clock_mode_t mode = sim_clock_mode();
+    sim_clock_reset();
+    sim_clock_set_mode(mode);
+    sd_card_reset(NULL);
+
     memset(gpio_levels, 0, sizeof(gpio_levels));
     memset(gpio_pull_ups, 0, sizeof(gpio_pull_ups));
     memset(gpio_pulled_up_at_init, 0, sizeof(gpio_pulled_up_at_init));
     memset(gpio_initialized, 0, sizeof(gpio_initialized));
     memset(gpio_deinitialized, 0, sizeof(gpio_deinitialized));
+    memset(gpio_deinit_counts, 0, sizeof(gpio_deinit_counts));
     memset(gpio_directions, 0, sizeof(gpio_directions));
     memset(gpio_functions, 0, sizeof(gpio_functions));
     memset(gpio_read_counts, 0, sizeof(gpio_read_counts));
@@ -151,25 +91,199 @@ void pico_mock_reset(void)
     gpio_input_sequence_size = 0U;
     gpio_input_sequence_position = 0U;
     gpio_input_sequence_pin = MOCK_PIN_COUNT;
+    gpio_input_sequence_exhausted = false;
+
     spi_initialized = false;
     spi_initial_baudrate = 0U;
     spi_baudrate = 0U;
+    spi_init_count = 0U;
+    spi_deinit_count = 0U;
     memset(spi_tx_log, 0, sizeof(spi_tx_log));
+    memset(spi_tx_cs_high, 0, sizeof(spi_tx_cs_high));
+    spi_tx_logged = 0U;
     spi_tx_count = 0U;
-    memset(commands, 0, sizeof(commands));
-    memset(command_bytes, 0, sizeof(command_bytes));
-    command_byte_count = 0U;
-    busy_cycles = 0U;
-    memset(response_bytes, 0, sizeof(response_bytes));
-    response_head = 0U;
-    response_tail = 0U;
-    mock_now = 0U;
+
+    chip_select_pin = MOCK_PIN_COUNT;
+    card_detect_pin = MOCK_PIN_COUNT;
+    scheduled_gpio_irq = false;
+    scheduled_gpio_irq_transfer = 0U;
+    scheduled_gpio_irq_pin = 0U;
+    scheduled_gpio_irq_events = 0U;
+    sync_chip_select();
+}
+
+/* ------------------------------------------------------------------ SPI */
+
+static uint8_t transfer_byte(uint8_t tx)
+{
+    spi_tx_count++;
+    if (spi_tx_logged < PICO_MOCK_TX_WINDOW) {
+        spi_tx_cs_high[spi_tx_logged] =
+            valid_pin(chip_select_pin) && gpio_levels[chip_select_pin];
+        spi_tx_log[spi_tx_logged++] = tx;
+    }
+
+    sim_clock_charge_spi_byte();
+    const uint8_t rx = sd_card_transfer(tx);
+
+    if (sd_card_eject_requested()) {
+        sd_card_clear_eject_request();
+        if (valid_pin(card_detect_pin)) {
+            gpio_levels[card_detect_pin] = true;
+            (void)pico_mock_gpio_irq_fire(card_detect_pin, GPIO_IRQ_EDGE_RISE);
+        }
+    }
+
+    if (scheduled_gpio_irq && spi_tx_count >= scheduled_gpio_irq_transfer) {
+        scheduled_gpio_irq = false;
+        (void)pico_mock_gpio_irq_fire(
+            scheduled_gpio_irq_pin, scheduled_gpio_irq_events);
+    }
+    return rx;
+}
+
+unsigned int spi_init(spi_inst_t *spi, unsigned int baudrate)
+{
+    (void)spi;
+    spi_initialized = true;
+    spi_init_count++;
+    spi_initial_baudrate = baudrate;
+    spi_baudrate = baudrate;
+    sim_clock_set_baud(baudrate);
+    return baudrate;
+}
+
+void spi_deinit(spi_inst_t *spi)
+{
+    (void)spi;
+    spi_deinit_count++;
+    spi_initialized = false;
+}
+
+unsigned int spi_set_baudrate(spi_inst_t *spi, unsigned int baudrate)
+{
+    (void)spi;
+    spi_baudrate = baudrate;
+    sim_clock_set_baud(baudrate);
+    return baudrate;
+}
+
+int spi_write_read_blocking(
+    spi_inst_t *spi,
+    const uint8_t *source,
+    uint8_t *destination,
+    size_t length)
+{
+    (void)spi;
+    for (size_t i = 0U; i < length; ++i) {
+        destination[i] = transfer_byte(source[i]);
+    }
+    return (int)length;
+}
+
+/* ----------------------------------------------------------------- GPIO */
+
+void gpio_init(unsigned int pin)
+{
+    if (valid_pin(pin)) {
+        gpio_pulled_up_at_init[pin] = gpio_pull_ups[pin];
+        gpio_initialized[pin] = true;
+        gpio_deinitialized[pin] = false;
+    }
+}
+
+void gpio_deinit(unsigned int pin)
+{
+    if (valid_pin(pin)) {
+        gpio_deinitialized[pin] = true;
+        gpio_deinit_counts[pin]++;
+        gpio_initialized[pin] = false;
+    }
+}
+
+void gpio_pull_up(unsigned int pin)
+{
+    if (valid_pin(pin)) {
+        gpio_pull_ups[pin] = true;
+    }
+}
+
+void gpio_put(unsigned int pin, bool value)
+{
+    if (valid_pin(pin)) {
+        gpio_levels[pin] = value;
+        if (pin == chip_select_pin) {
+            sync_chip_select();
+        }
+    }
+}
+
+bool gpio_get(unsigned int pin)
+{
+    if (!valid_pin(pin)) {
+        return false;
+    }
+    gpio_read_counts[pin]++;
+    if (pin == gpio_input_sequence_pin) {
+        if (gpio_input_sequence_position < gpio_input_sequence_size) {
+            return gpio_input_sequence[gpio_input_sequence_position++];
+        }
+        gpio_input_sequence_exhausted = true;
+    }
+    return gpio_levels[pin];
+}
+
+void gpio_set_dir(unsigned int pin, bool out)
+{
+    if (valid_pin(pin)) {
+        gpio_directions[pin] = out;
+    }
+}
+
+void gpio_set_function(unsigned int pin, unsigned int function)
+{
+    if (valid_pin(pin)) {
+        gpio_functions[pin] = function;
+    }
+}
+
+/* ----------------------------------------------------------------- time */
+
+absolute_time_t make_timeout_time_ms(uint32_t milliseconds)
+{
+    return sim_clock_timeout_us(milliseconds);
+}
+
+bool time_reached(absolute_time_t target)
+{
+    return sim_clock_time_reached(target);
+}
+
+void sleep_ms(uint32_t milliseconds)
+{
+    sim_clock_sleep_ms(milliseconds);
+}
+
+/* -------------------------------------------------------------- queries */
+
+void pico_mock_gpio_irq_fire_after_spi_transfers(
+    size_t additional_transfers,
+    unsigned int gpio,
+    uint32_t events)
+{
+    scheduled_gpio_irq = true;
+    scheduled_gpio_irq_transfer = spi_tx_count + additional_transfers;
+    scheduled_gpio_irq_pin = gpio;
+    scheduled_gpio_irq_events = events;
 }
 
 void pico_mock_gpio_set_input(unsigned int pin, bool value)
 {
     if (valid_pin(pin)) {
         gpio_levels[pin] = value;
+        if (pin == chip_select_pin) {
+            sync_chip_select();
+        }
     }
 }
 
@@ -183,14 +297,19 @@ bool pico_mock_gpio_set_input_sequence(
             || (value_count != 0U && values == NULL)) {
         return false;
     }
-
     gpio_input_sequence_pin = pin;
     gpio_input_sequence_size = value_count;
     gpio_input_sequence_position = 0U;
+    gpio_input_sequence_exhausted = false;
     if (value_count != 0U) {
         memcpy(gpio_input_sequence, values, value_count * sizeof(values[0]));
     }
     return true;
+}
+
+bool pico_mock_gpio_input_sequence_exhausted(void)
+{
+    return gpio_input_sequence_exhausted;
 }
 
 size_t pico_mock_gpio_read_count(unsigned int pin)
@@ -218,44 +337,86 @@ bool pico_mock_gpio_was_deinitialized(unsigned int pin)
     return valid_pin(pin) && gpio_deinitialized[pin];
 }
 
+size_t pico_mock_gpio_deinit_count(unsigned int pin)
+{
+    return valid_pin(pin) ? gpio_deinit_counts[pin] : 0U;
+}
+
 unsigned int pico_mock_gpio_function(unsigned int pin)
 {
     return valid_pin(pin) ? gpio_functions[pin] : 0U;
 }
 
-bool pico_mock_spi_is_initialized(void)
+bool pico_mock_gpio_direction_is_output(unsigned int pin)
 {
-    return spi_initialized;
+    return valid_pin(pin) && gpio_directions[pin];
 }
 
-unsigned int pico_mock_spi_initial_baudrate(void)
+bool pico_mock_spi_is_initialized(void) { return spi_initialized; }
+unsigned int pico_mock_spi_initial_baudrate(void) { return spi_initial_baudrate; }
+unsigned int pico_mock_spi_baudrate(void) { return spi_baudrate; }
+size_t pico_mock_spi_transfer_count(void) { return spi_tx_count; }
+size_t pico_mock_spi_init_count(void) { return spi_init_count; }
+size_t pico_mock_spi_deinit_count(void) { return spi_deinit_count; }
+
+uint64_t pico_mock_now_ms(void) { return sim_clock_now_us() / 1000U; }
+uint64_t pico_mock_now_us(void) { return sim_clock_now_us(); }
+void pico_mock_advance_us(uint64_t us) { sim_clock_advance_us(us); }
+void pico_mock_set_clock_mode(sim_clock_mode_t mode) { sim_clock_set_mode(mode); }
+uint64_t pico_mock_poll_count(void) { return sim_clock_poll_count(); }
+
+void pico_mock_sd_use_chip_select(unsigned int pin)
 {
-    return spi_initial_baudrate;
+    chip_select_pin = pin;
+    sync_chip_select();
 }
 
-unsigned int pico_mock_spi_baudrate(void)
+void pico_mock_sd_use_card_detect(unsigned int pin)
 {
-    return spi_baudrate;
+    card_detect_pin = pin;
 }
 
-size_t pico_mock_spi_transfer_count(void)
+bool pico_mock_spi_tx_chip_select_high(size_t index)
 {
-    return spi_tx_count;
+    return index < spi_tx_logged && spi_tx_cs_high[index];
 }
 
-const uint8_t *pico_mock_spi_tx_log(void)
+const uint8_t *pico_mock_spi_tx_log(void) { return spi_tx_log; }
+size_t pico_mock_spi_tx_log_length(void) { return spi_tx_logged; }
+
+bool pico_mock_sd_set_response_delay(uint8_t command, size_t bytes)
 {
-    return spi_tx_log;
+    return sd_card_script_response_delay(command, bytes);
+}
+
+bool pico_mock_sd_set_idle_responses(uint8_t command, size_t responses)
+{
+    return sd_card_script_idle_responses(command, responses);
+}
+
+bool pico_mock_sd_set_busy_after_payload(uint8_t command, bool busy)
+{
+    return sd_card_script_busy_after_payload(command, busy);
+}
+
+bool pico_mock_sd_set_stall_after_r1(uint8_t command, bool stall)
+{
+    return sd_card_script_stall_after_r1(command, stall);
 }
 
 size_t pico_mock_sd_pending_response_count(void)
 {
-    return response_tail - response_head;
+    return sd_card_pending_scripted_bytes();
 }
 
 void pico_mock_sd_set_busy_cycles(size_t cycles)
 {
-    busy_cycles = cycles;
+    sd_card_set_busy_bytes(cycles);
+}
+
+void pico_mock_sd_set_busy_forever(void)
+{
+    sd_card_set_busy_forever();
 }
 
 bool pico_mock_sd_set_command(
@@ -264,141 +425,15 @@ bool pico_mock_sd_set_command(
     const uint8_t *payload,
     size_t payload_size)
 {
-    if (command >= MOCK_COMMAND_COUNT
-            || payload_size > PICO_MOCK_MAX_COMMAND_PAYLOAD
-            || (payload_size != 0U && payload == NULL)) {
-        return false;
-    }
-
-    mock_command_t *const behavior = &commands[command];
-    behavior->configured = true;
-    behavior->r1 = r1;
-    behavior->payload_size = payload_size;
-    if (payload_size != 0U) {
-        memcpy(behavior->payload, payload, payload_size);
-    }
-    return true;
+    return sd_card_script_command(command, r1, payload, payload_size);
 }
 
 size_t pico_mock_sd_command_count(uint8_t command)
 {
-    return command < MOCK_COMMAND_COUNT ? commands[command].count : 0U;
+    return sd_card_command_count(command);
 }
 
 uint32_t pico_mock_sd_last_argument(uint8_t command)
 {
-    return command < MOCK_COMMAND_COUNT
-        ? commands[command].last_argument
-        : 0U;
-}
-
-void gpio_init(unsigned int pin)
-{
-    if (valid_pin(pin)) {
-        gpio_pulled_up_at_init[pin] = gpio_pull_ups[pin];
-        gpio_initialized[pin] = true;
-        gpio_deinitialized[pin] = false;
-    }
-}
-
-void gpio_deinit(unsigned int pin)
-{
-    if (valid_pin(pin)) {
-        gpio_deinitialized[pin] = true;
-        gpio_initialized[pin] = false;
-    }
-}
-
-void gpio_pull_up(unsigned int pin)
-{
-    if (valid_pin(pin)) {
-        gpio_pull_ups[pin] = true;
-    }
-}
-
-void gpio_put(unsigned int pin, bool value)
-{
-    if (valid_pin(pin)) {
-        gpio_levels[pin] = value;
-    }
-}
-
-bool gpio_get(unsigned int pin)
-{
-    if (!valid_pin(pin)) {
-        return false;
-    }
-
-    gpio_read_counts[pin]++;
-    if (pin == gpio_input_sequence_pin
-            && gpio_input_sequence_position < gpio_input_sequence_size) {
-        return gpio_input_sequence[gpio_input_sequence_position++];
-    }
-    return gpio_levels[pin];
-}
-
-void gpio_set_dir(unsigned int pin, bool out)
-{
-    if (valid_pin(pin)) {
-        gpio_directions[pin] = out;
-    }
-}
-
-void gpio_set_function(unsigned int pin, unsigned int function)
-{
-    if (valid_pin(pin)) {
-        gpio_functions[pin] = function;
-    }
-}
-
-unsigned int spi_init(spi_inst_t *spi, unsigned int baudrate)
-{
-    (void)spi;
-    spi_initialized = true;
-    spi_initial_baudrate = baudrate;
-    spi_baudrate = baudrate;
-    return baudrate;
-}
-
-void spi_deinit(spi_inst_t *spi)
-{
-    (void)spi;
-    spi_initialized = false;
-}
-
-unsigned int spi_set_baudrate(spi_inst_t *spi, unsigned int baudrate)
-{
-    (void)spi;
-    spi_baudrate = baudrate;
-    return baudrate;
-}
-
-int spi_write_read_blocking(
-    spi_inst_t *spi,
-    const uint8_t *source,
-    uint8_t *destination,
-    size_t length)
-{
-    (void)spi;
-    for (size_t i = 0U; i < length; ++i) {
-        destination[i] = transfer_byte(source[i]);
-    }
-    return (int)length;
-}
-
-absolute_time_t make_timeout_time_ms(uint32_t milliseconds)
-{
-    return mock_now + milliseconds;
-}
-
-bool time_reached(absolute_time_t target)
-{
-    const bool reached = mock_now >= target;
-    mock_now++;
-    return reached;
-}
-
-void sleep_ms(uint32_t milliseconds)
-{
-    mock_now += milliseconds;
+    return sd_card_last_argument(command);
 }

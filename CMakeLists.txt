@@ -52,6 +52,7 @@ set(TAVERNKEEP_SOURCES
     src/main.c
     src/platform/board.c
     src/platform/debug.c
+    src/platform/gpio_irq.c
     src/storage/filesystem.c
     src/storage/sd_spi.c
 )

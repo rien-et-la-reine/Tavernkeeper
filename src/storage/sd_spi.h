@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "hardware/spi.h"
 
@@ -28,6 +29,7 @@ typedef struct {
     bool card_type_legacy;
     bool card_type_hcxc;
     uint64_t block_count;
+    atomic_bool removal_latched;
 } sd_spi_t;
 
 block_device_result_t sd_spi_configure(

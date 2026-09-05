@@ -1,0 +1,279 @@
+# Protocol and specification findings
+
+Every rule the SD tests encode, where it comes from, whether the implementation
+follows it, and which test holds it in place. Findings are numbered P-nn and
+referenced from the test sources.
+
+## Sources consulted
+
+| Source | Used for |
+| --- | --- |
+| SD Physical Layer Simplified Specification v2.00, [ECE UT Austin mirror](https://users.ece.utexas.edu/~valvano/EE345M/SD_Physical_Layer_Spec.pdf) | SPI response formats R1/R1b/R3/R7, control tokens, CSD v1.0 and v2.0 field positions and capacity formulas, READ_BL_LEN range, default-speed clock ceiling |
+| SD Physical Layer Simplified Specification v6.00, [mirror](https://www.taterli.com/wp-content/uploads/2017/05/Physical-Layer-Simplified-SpecificationV6.0.pdf) | cross-check of the SPI bus-transfer protection and control-token sections |
+| ChaN, *How to Use MMC/SDC*, reproduced as [EE445M Lecture 12.1](https://users.ece.utexas.edu/~valvano/EE345M/view12_SPI_SDC.pdf) | N_CR byte window, CMD12's positional stuff byte, data packet tokens, data-response codes, which commands need a valid CRC in SPI mode, busy signalling |
+| [Linux `mmc_spi`: wait more bytes for card response](https://lkml.iu.edu/hypermail/linux/kernel/0903.1/01387.html) | real-world response latency beyond the specified window |
+| [Linux `mmc_spi`: synchronize STOP_TRANSMISSION with next data token](https://lkml.iu.edu/hypermail/linux/kernel/1403.0/00865.html) | the CMD12 / in-flight-data collision and its consequences |
+| [Gough Lui's SD/SDHC/SDXC CID CSD register database](https://goughlui.com/other-pages/sdsdhcsdxc-cid-csd-register-data-database/) | CSD registers captured from real cards, with marketed capacities |
+| [Raspberry Pi Pico SDK hardware reference](https://www.raspberrypi.com/documentation/pico-sdk/hardware.html) | shared GPIO callback ownership, DMA abort and RP2350-E5 (future work only) |
+
+The specification is the authority; the secondary sources are used where the
+simplified specification omits a detail, and are cross-checked against each
+other and against arithmetic wherever possible.
+
+## P-01 — CRC7 is checked on CMD0 and CMD8 even though CRC mode is off
+
+**Rule.** In SPI mode CRC checking is disabled by default, so a host may send a
+placeholder CRC for most commands. CMD0 and CMD8 are the exception: they bracket
+the transition into SPI mode and the card validates them. A command frame is
+five bytes plus `(CRC7 << 1) | 1`.
+
+**Verified independently.** CRC7 over `40 00 00 00 00` is 0x4A, giving the frame
+byte 0x95; over `48 00 00 01 AA` it is 0x43, giving 0x87. Both were recomputed
+from the polynomial rather than taken from a source, and the test recomputes
+them again at run time.
+
+**Implementation.** `sd_spi_command()` sends `0x94|0x01` for CMD0 and
+`0x86|0x01` for CMD8, which evaluate to 0x95 and 0x87. Correct.
+
+**Tests.** `test_command_framing_and_crc` recomputes both constants and confirms
+the bytes on the wire; `test_bad_cmd0_crc_is_rejected_by_the_card` runs against a
+card with CRC checking enabled to prove the check has teeth. Mutation
+`cmd8-crc-constant` is caught by six executables. The card model validates CMD0
+and CMD8 unconditionally, so these constants can no longer be wrong silently.
+
+## P-02 — ACMD41 requires an immediately preceding CMD55
+
+**Rule.** An application command is CMD55 followed by the command; without the
+prefix the card treats CMD41 as an unknown command and sets the
+illegal-command bit.
+
+**Implementation.** Correct: the initialisation loop issues CMD55 then CMD41 on
+every iteration and checks both responses.
+
+**Tests.** `test_acmd41_is_always_prefixed_by_cmd55` walks the trace and asserts
+every CMD41 carries the application flag, and that the CMD55 and CMD41 counts
+match. Mutation `drop-cmd55` is caught by five executables. This was
+undetectable before, because the previous fake keyed responses on the command
+index alone.
+
+## P-03 — ACMD41's HCS bit selects high-capacity support
+
+**Rule.** Bit 30 of the ACMD41 argument tells the card the host supports high
+capacity. A high-capacity card polled with HCS clear never leaves the idle
+state.
+
+**Implementation.** Correct: `0x40000000` for a non-legacy card, `0` for a v1
+card.
+
+**Tests.** `test_acmd41_is_always_prefixed_by_cmd55` asserts the argument on
+every occurrence; `test_legacy_card_omits_the_hcs_bit` covers the v1 case;
+`test_high_capacity_card_needs_hcs_to_leave_idle` proves the driver gives up on
+its own 1200 ms budget rather than hanging. Mutation `acmd41-hcs-bit` is caught.
+
+## P-04 — N_CR, the response window, and the driver's poll limit
+
+**Rule.** The command response time in SPI mode is quoted as 0 to 8 bytes for an
+SD card. `sd_spi_command()` reads at most eight bytes while waiting for a byte
+with bit 7 clear, so it accepts a response at read positions one through eight,
+which is at most **seven** filler bytes.
+
+**Finding.** Under the strictest reading — N_CR counting filler bytes, so a
+worst-case card answers on the ninth read — the driver is one byte short of the
+specified window. Separately, Linux's `mmc_spi` driver raised its own limit from
+8 to 16 after observing real cards that needed 12. The failure mode is a generic
+I/O error during bring-up or a read, with nothing to indicate the cause.
+
+**Disposition.** Not changed here: widening the window is a tolerance decision
+with hardware-validation consequences, and it is the owner's call. The current
+boundary is pinned exactly from both sides, and the more tolerant behaviour is
+registered as gap **SD-005**.
+
+**Tests.** `test_response_latency_boundary` sweeps 0 to 8 filler bytes for both
+bring-up and CMD17, asserts success below the limit and failure at it, and
+asserts the failure is immediate rather than a timeout. Mutation
+`r1-poll-limit-off-by-one` is caught.
+
+## P-05 — data error tokens
+
+**Rule.** When a read fails the card sends an error token instead of a data
+packet: bits 7..4 are zero and bits 3..0 carry error flags — bit 0 Error, bit 1
+CC Error, bit 2 Card ECC Failed, bit 3 Out Of Range. Any combination of the low
+four bits is valid, so there are fifteen legal tokens. A byte of 0x00 has no
+error bits and is not an error token.
+
+**Implementation.** `sd_spi_is_data_error_token()` tests
+`(token & 0xF0) == 0 && (token & 0x0F) != 0`. Correct, including the multi-bit
+combinations.
+
+**Tests.** `test_data_error_tokens_are_recognised_immediately` covers all fifteen
+tokens on both read paths and asserts recognition is immediate — under a
+microsecond and under forty bus bytes — rather than the same generic result
+reached by exhausting the 100 ms data-token wait. That distinction is the whole
+point: a driver that ignored the token would still return IO_ERROR eventually.
+`test_zero_byte_is_not_a_data_error_token` covers the negative case and confirms
+the driver still honours its 100 ms budget. Mutations
+`data-error-token-mask` and `data-error-token-ignored` are both caught.
+
+## P-06 — CSD field positions and capacity
+
+**Rule.** CSD version 1.0: READ_BL_LEN at bits 83..80 with supported values 9 to
+11; C_SIZE at bits 73..62; C_SIZE_MULT at bits 49..47; capacity is
+`(C_SIZE + 1) * 2^(C_SIZE_MULT + 2) * 2^READ_BL_LEN`. CSD version 2.0: C_SIZE at
+bits 69..48, capacity `(C_SIZE + 1) * 512 KiB`, so `(C_SIZE + 1) * 1024` blocks
+of 512 bytes.
+
+**Implementation.** All field extractions and both formulas are correct, and
+CSD structure 2 and 3 are refused with NOT_IMPLEMENTED.
+
+**Independent check.** The tests decode five CSD registers captured from real
+cards and compare against the cards' marketed capacities:
+
+| Card | CSD | Decoded blocks | Capacity |
+| --- | --- | --- | --- |
+| Kingston 2 GB SDSC | `002d00325b5a83d5fefbff80168000cf` | 4 022 272 | 2.06 GB |
+| SanDisk 2 GB Blue SDSC | `002600325f5a83c93efbcfff928040cb` | 3 970 048 | 2.03 GB |
+| Samsung 32 GB C10 SDHC | `400e00325b590000ee9d7f800a400013` | 62 552 064 | 32.0 GB |
+| Toshiba 64 GB SDXC | `400e00325b590001dbff7f800a40003f` | 124 780 544 | 63.9 GB |
+| Kingston 128 GB SDXC | `400e00325b590003a5df7f800a400007` | 244 809 728 | 125.3 GB |
+
+Each vector's own CRC7 is verified before use, so a transcription error fails
+loudly instead of looking like a decoder bug. A sixth candidate was discarded
+for exactly that reason: its CRC7 did not check out.
+
+Both SDSC vectors use READ_BL_LEN 10, confirming that a 2 GB standard-capacity
+card cannot be encoded with READ_BL_LEN 9 — the largest C_SIZE and C_SIZE_MULT
+pair reaches only 1 GiB. The harness asserts this rather than silently
+producing an impossible card.
+
+**Tests.** `test_real_card_csd_registers`, `test_csd_structure_and_field_rejection`
+(which sweeps all sixteen READ_BL_LEN encodings), and the property tests
+`test_csd_v1_capacity_property` and `test_csd_v2_capacity_property`, which cover
+every C_SIZE_MULT and READ_BL_LEN against edge and random C_SIZE values.
+Mutations `csd-v2-capacity-multiplier`, `csd-v2-c-size-mask`,
+`csd-v1-mult-off-by-one`, `csd-v1-read-bl-len-range` and
+`csd-structure-check-removed` are all caught.
+
+## P-07 — CMD12 has a positional stuff byte, and the card may still be sending
+
+**Rule.** In SPI mode the byte immediately following CMD12 is a stuff byte and
+must be discarded before the R1 response. CMD12's response is R1b: R1 followed
+by a busy period during which the card holds the line low.
+
+**Implementation.** `sd_spi_stop_transmission()` discards exactly one stuff byte,
+polls up to eight bytes for R1, then waits for the busy period to clear.
+Correct, and a subtle detail to have got right.
+
+**Finding.** The rule above assumes the card has stopped. It has not: during a
+CMD18 stream the card keeps sending until it decodes CMD12, so residual read
+data can still be on the bus while the host is looking for the response. The
+driver treats the first byte with bit 7 clear as R1, and a data byte with bit 7
+clear satisfies that. Measured against the model: with zero to seven residual
+bytes the read succeeds; with eight or more it returns IO_ERROR even though
+every block arrived intact, and which way it goes depends on the byte values of
+the following block. Linux carries a fix for a related collision, where an
+out-of-range error token arriving as CMD12 is sent left some cards rejecting
+every subsequent command until reset.
+
+**Disposition.** Not changed here. The two candidate fixes — draining to the
+next data token before sending CMD12, as Linux does, or not gating success on
+CMD12's response at all — are design decisions with latency and
+hardware-validation consequences. Registered as gap **SD-004** with a failing
+regression and a reproduction across zero to sixteen residual bytes.
+
+**Tests.** `sd_gap_stop-residual`; mutation `cmd12-stuff-byte-missing` is caught
+by the enabled suite.
+
+## P-08 — bring-up requires at least 74 clocks with the card deselected
+
+**Rule.** The card needs at least 74 clock cycles with chip select released
+before it will accept CMD0.
+
+**Implementation.** Ten 0xFF bytes, which is 80 clocks. Correct.
+
+**Tests.** `test_idle_clocks_precede_the_first_command` asserts the byte values,
+that chip select was genuinely high for all ten, and that the first command byte
+only appears after chip select drops.
+
+## P-09 — OCR bit 31 is the power-up status and bit 30 is CCS
+
+**Rule.** CMD58 returns R3: R1 followed by the four-byte OCR. Bit 31 is set once
+the card has finished its power-up sequence; bit 30, CCS, is set for a
+high-capacity card and selects block addressing.
+
+**Implementation.** Correct on both bits, and CCS is ignored for a card that
+identified as legacy, which is sound: a v1 card cannot be high capacity.
+
+**Tests.** `test_card_variant_initialization` covers CCS across four card kinds;
+`test_ocr_reports_card_still_powering_up` clears bit 31 and asserts bring-up
+fails without going on to read the CSD. Mutations `ocr-ccs-bit` and
+`ocr-powerup-check-removed` are both caught.
+
+## P-10 — addressing mode follows card capacity
+
+**Rule.** High-capacity cards take a block address in read and write commands;
+standard-capacity cards take a byte address, which must be aligned to the block
+length. CMD16 sets the block length and is only meaningful for standard-capacity
+cards.
+
+**Implementation.** Correct. CMD16 with argument 512 is issued only when CCS is
+clear.
+
+**Boundary.** The driver passes the address as `uint32_t`. The largest CSD v1
+encoding is 4 GiB, whose last block sits at byte address `0xFFFFFE00` — 512
+bytes below a 32-bit overflow. The largest CSD v2 encoding gives exactly `2^32`
+blocks, whose last LBA is exactly `UINT32_MAX`. Both fit, with no margin. This
+is safe only because CSD v3 (SDUC) is refused; an SDUC card would exceed 32 bits
+and truncate silently.
+
+**Tests.** `test_addressing_mode_per_card_type`, `test_capacity_and_address_boundaries`,
+`test_csd_v1_maximum_encoding_is_addressable`, and the
+`test_address_conversion_property` fuzz over random cards and addresses.
+Mutations `sdsc-byte-address-dropped`, `sdsc-byte-address-inverted`,
+`address-truncated-to-16-bits`, `cmd16-skipped-for-sdsc` and
+`range-check-count-removed` are all caught.
+
+## P-11 — the default-speed clock ceiling is 25 MHz
+
+**Rule.** Default speed mode runs from 0 to 25 MHz. Bring-up runs at a low
+frequency, typically 100–400 kHz, and the host raises the clock only after the
+card is initialised.
+
+**Implementation.** `sd_spi_configure()` rejects a configured rate above 25 MHz;
+bring-up runs at 400 kHz and the configured rate is applied only after success.
+Correct.
+
+**Tests.** `test_card_variant_initialization` asserts both baud rates on every
+card kind. Mutations `baud-limit-removed` and `baud-raised-before-init` are
+caught.
+
+## P-12 — read data CRC16
+
+**Rule.** Every data packet carries a 16-bit CRC (CRC-CCITT, polynomial
+`x^16 + x^12 + x^5 + 1`) after the payload.
+
+**Implementation.** The driver reads the two bytes and discards them; its own
+comment marks this as a TODO. A card returning corrupt data is therefore
+reported as a successful read.
+
+**Disposition.** Registered as gap **SD-003**. The model computes a real CRC16
+over every block it sends, so the regression that will pass once validation
+exists is already written. The consequence for NFR-003 is silent corruption
+rather than a detected error, which is worth deciding on deliberately.
+
+**Tests.** `test_read_data_crc_is_not_validated` pins the current behaviour and
+proves the corruption reaches the caller; `sd_gap_data-crc` asserts the desired
+behaviour and fails.
+
+## Discrepancies found between documentation and code
+
+- The root `README.md` states that "Storage and filesystem entry points
+  explicitly return not-implemented or not-initialized results; no card protocol
+  or fake filesystem behavior exists." The SD SPI driver has been implemented
+  since. Corrected as part of this work.
+- `docs/architecture.md` requires that "a transaction interrupted by even an
+  unconfirmed removal edge must fail and must not resume" and that teardown
+  happen "exactly once". The implementation violated both; see
+  [KNOWN_GAPS.md](KNOWN_GAPS.md) SD-001 and SD-002, now fixed with enabled
+  regressions.
+- `docs/validation.md` contained only templates. A validation record covering
+  the host evidence has been added.
